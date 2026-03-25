@@ -531,52 +531,56 @@ def _build_path_from_velocity_2d(
         gamma.append(gamma[-1] + step)
     return gamma
 
-
 def optimize_path_2d(
-    model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
-    mu: torch.Tensor, N: int = 50,
-    G: int = 16, patch_size: int = 14,
-    n_iter: int = 15, lr: float = 0.08,
-) -> list[torch.Tensor]:
+    model, x, baseline, mu, N=50, G=16, patch_size=14,
+    n_iter=15, lr=0.05,
+):
     device    = x.device
     delta_x   = x - baseline
     group_map = _build_spatial_groups(model, x, baseline, G, patch_size)
 
-    V       = torch.ones(G, N, device=device)
+    # Log-space velocity: softmax ensures each group's steps sum to 1
+    # This eliminates the runaway-V artifact entirely
+    log_V  = torch.zeros(G, N, device=device)
     best_cv = float("inf")
-    best_V  = V.clone()
+    best_logV = log_V.clone()
 
-    def _cv_of(Vm):
-        gp   = _build_path_from_velocity_2d(baseline, delta_x, Vm, group_map, N)
+    def _cv_of(lv):
+        V  = torch.softmax(lv, dim=1) * N   # scale so mean step = delta_x/N
+        gp = _build_path_from_velocity_2d(baseline, delta_x, V, group_map, N)
         d_v  = torch.zeros(N, device=device)
         df_v = torch.zeros(N, device=device)
+        f_prev = _forward_scalar(model, gp[0])
         for kk in range(N):
-            grd       = _gradient(model, gp[kk])
-            step_kk   = gp[kk + 1] - gp[kk]
-            d_v[kk]   = _dot(grd, step_kk)
-            df_v[kk]  = (_forward_scalar(model, gp[kk + 1])
-                         - _forward_scalar(model, gp[kk]))
+            grd      = _gradient(model, gp[kk])
+            step_kk  = gp[kk + 1] - gp[kk]
+            d_v[kk]  = _dot(grd, step_kk)
+            f_next   = _forward_scalar(model, gp[kk + 1])
+            df_v[kk] = f_next - f_prev
+            f_prev   = f_next
         return compute_CV2(d_v, df_v, mu)
 
-    eps = 0.05
-    for _ in range(n_iter):
-        cv2 = _cv_of(V)
+    eps = 0.1   # larger eps more stable with softmax reparametrisation
+    for it in range(n_iter):
+        cv2 = _cv_of(log_V)
         if cv2 < best_cv:
-            best_cv = cv2
-            best_V  = V.clone()
+            best_cv   = cv2
+            best_logV = log_V.clone()
 
-        grad_V = torch.zeros_like(V)
-        for g in range(G):
-            k = torch.randint(0, N, (1,)).item()
-            V[g, k] += eps
-            cv2_plus = _cv_of(V)
-            grad_V[g, k] = (cv2_plus - cv2) / eps
-            V[g, k] -= eps
+        grad_logV = torch.zeros_like(log_V)
+        # Probe one full group per iteration (all N steps) — much lower variance
+        g = it % G    # cycle through groups deterministically
+        for k in range(N):
+            log_V[g, k] += eps
+            cv2_plus = _cv_of(log_V)
+            grad_logV[g, k] = (cv2_plus - cv2) / eps
+            log_V[g, k] -= eps
 
-        V = torch.clamp(V - lr * grad_V, min=0.01)
+        log_V = log_V - lr * grad_logV
+        # No clamp needed — softmax handles normalisation
 
+    best_V = torch.softmax(best_logV, dim=1) * N
     return _build_path_from_velocity_2d(baseline, delta_x, best_V, group_map, N)
-
 
 def joint_ig(
     model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
@@ -928,8 +932,10 @@ def run_experiment(N: int = 50, device: Optional[torch.device] = None,
         idgi(model, x, baseline, N),
         guided_ig(model, x, baseline, N),
         mu_optimized_ig(model, x, baseline, N, tau=0.005, n_iter=300),
-        joint_ig(model, x, baseline, N, n_alternating=2,
-                 tau=0.005, mu_iter=300),
+        joint_ig(model, x, baseline, N,
+            n_alternating=2,
+            tau=0.005, mu_iter=300,
+            path_iter=G)   # path_iter=G so every group gets probed once per run
     ]
 
     for m in methods:
