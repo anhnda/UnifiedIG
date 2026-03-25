@@ -1,7 +1,3 @@
-# ═════════════════════════════════════════════════════════════════════════════
-# §1  DEVICE SELECTION
-# ═════════════════════════════════════════════════════════════════════════════
-
 from __future__ import annotations
 
 import argparse
@@ -17,8 +13,6 @@ import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as T
 
-
-from __future__ import annotations
 
 import argparse
 import json
