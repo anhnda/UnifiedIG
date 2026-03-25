@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as T
 
-from indel_utils import AttributionResult
+from indel_utils import AttributionResult, StepInfo
 def get_device(force: Optional[str] = None) -> torch.device:
     """Select compute device. Defaults to CPU for sequential scalar ops."""
     if force:
