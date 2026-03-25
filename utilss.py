@@ -1,7 +1,21 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # §1  DEVICE SELECTION
 # ═════════════════════════════════════════════════════════════════════════════
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+import torchvision.transforms as T
 def get_device(force: Optional[str] = None) -> torch.device:
     """Select compute device. Defaults to CPU for sequential scalar ops."""
     if force:
