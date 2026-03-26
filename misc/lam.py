@@ -55,7 +55,6 @@ from utilss import (
     get_device, AttributionResult, StepInfo, InsDelScores,
     compute_Var_nu, compute_CV2, compute_Q, compute_all_metrics,
     compute_insertion_deletion, run_insertion_deletion,
-    compute_region_insertion_deletion, run_region_insertion_deletion,
     visualize_step_fidelity, visualize_insertion_deletion,
 )
 
@@ -242,24 +241,19 @@ def _straight_line_pass(model: nn.Module, x: torch.Tensor,
         grad_batch = torch.cat(g_chunks, dim=0)      # (N, C, H, W)
 
     # ── Unpack results ──
-    # f_vals layout: [f_bl, f(γ_0), f(γ_1), ..., f(γ_{N-1}), f_x]
-    # This gives N+2 entries. df[k] = f_vals[k+1] - f_vals[k]:
-    #   df[0] = f(γ_0) - f_bl ≈ 0  (γ_0 = baseline)
-    #   df[k] = f(γ_k) - f(γ_{k-1})  for k >= 1
-    # d[k] = grad(γ_k) · step  predicts change FROM γ_k
-    #
-    # This "backward-looking" df convention matches the original sequential
-    # code and empirically produces better fidelity metrics because the
-    # gradient at γ_k is more accurate for the interval ending at γ_k
-    # than for the interval starting at γ_k (backward vs forward Euler).
-    f_vals_inner = f_batch.tolist()                  # N floats
-    f_vals = [f_bl] + f_vals_inner + [f_x]
+    # gamma_batch has N points: γ_0=baseline, γ_1, ..., γ_{N-1}
+    # We need f at N+1 points: γ_0, γ_1, ..., γ_{N-1}, γ_N=x
+    # f_batch gives f(γ_0) through f(γ_{N-1}), we add f(x) at the end
+    f_vals_inner = f_batch.tolist()                  # N floats: f(γ_0)..f(γ_{N-1})
+    f_vals = f_vals_inner + [f_x]                    # N+1 floats: f(γ_0)..f(γ_N=x)
 
-    # d_k = ∇f(γ_k) · step
+    # d_k = ∇f(γ_k) · step,  for each k = 0..N-1
+    # This is the gradient-predicted change for the step γ_k → γ_{k+1}
     d_tensor = (grad_batch * step).view(N, -1).sum(dim=1)   # (N,)
     d_list = d_tensor.tolist()
 
-    # Δf_k = f_vals[k+1] - f_vals[k]
+    # Δf_k = f(γ_{k+1}) - f(γ_k),  for each k = 0..N-1
+    # Now properly aligned: d[k] and df[k] both refer to the step γ_k → γ_{k+1}
     df_list = [f_vals[k + 1] - f_vals[k] for k in range(N)]
 
     # grad norms
@@ -371,10 +365,8 @@ def guided_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     attr = _rescale(attr, target)
 
     mu = torch.full((N,), 1.0 / N, device=device)
-    result = _pack_result("Guided IG", attr, d_list, df_list, f_vals,
-                          gnorms, mu, N, t0)
-    result.gamma_pts = gamma_pts  # store for reuse by joint_ig
-    return result
+    return _pack_result("Guided IG", attr, d_list, df_list, f_vals,
+                        gnorms, mu, N, t0)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -534,26 +526,32 @@ def _eval_path_batched(model, gamma_pts, N, device):
     """
     FIX 2 — core helper: evaluate d_k, Δf_k for a path in batched calls.
 
-    Uses the backward-looking df convention matching _straight_line_pass:
-      d[k] = grad(γ_k) · (γ_{k+1} - γ_k)
-      df[k] = f(γ_k) - f(γ_{k-1})  (with df[0] ≈ 0)
+    Given gamma_pts (list of N+1 tensors, each (1, C, H, W)):
+      1. Batch all N+1 points → one forward call  → f_vals (N+1,)
+      2. Batch the first N points → one backward call → grads (N, C, H, W)
+      3. Compute d_k = grad_k · (γ_{k+1} - γ_k) and Δf_k = f_{k+1} - f_k
 
     Returns: (d_vec, df_vec)  both (N,) tensors
     """
+    # Stack all N+1 points → (N+1, C, H, W)
     all_pts = torch.cat(gamma_pts, dim=0)               # (N+1, C, H, W)
 
+    # Forward all points in one call
     with torch.no_grad():
         f_all = model(all_pts)                           # (N+1,)
 
+    # Backward only the first N points (we need grads at γ_0 .. γ_{N-1})
     pts_N = all_pts[:N]                                  # (N, C, H, W)
     grads_N = _gradient_batch(model, pts_N)              # (N, C, H, W)
 
+    # Steps: Δγ_k = γ_{k+1} - γ_k
     steps = all_pts[1:] - all_pts[:N]                    # (N, C, H, W)
+
+    # d_k = ∇f(γ_k) · Δγ_k   (per-sample dot product)
     d_vec = (grads_N * steps).view(N, -1).sum(dim=1)     # (N,)
 
-    # Backward-looking: prepend f(γ_0) so df[0] = f(γ_0) - f(γ_0) = 0
-    f_ext = torch.cat([f_all[0:1], f_all])               # (N+2,)
-    df_vec = f_ext[1:N+1] - f_ext[:N]                    # (N,)
+    # Δf_k = f(γ_{k+1}) - f(γ_k)
+    df_vec = f_all[1:] - f_all[:N]                       # (N,)
 
     return d_vec, df_vec
 
@@ -652,20 +650,14 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
              N: int = 50, G: int = 16, patch_size: int = 14,
              n_alternating: int = 2, tau: float = 0.005,
              mu_iter: int = 300, path_iter: int = 10,
-             init_path: Optional[list[torch.Tensor]] = None,
              ) -> AttributionResult:
     """
     Joint optimisation: alternating min of CV²(φ) over (γ, μ).
 
-    Parameters
-    ----------
-    init_path : optional list of N+1 tensors (each (1,C,H,W)) to use as
-                the initial path instead of the straight line. Pass the
-                gamma_pts from Guided IG to start from a better baseline.
-                If None, starts from the straight line (default).
-
     Regression guard: path optimisation only takes effect if it
-    improves Q over the current best.  This guarantees Joint ≥ init.
+    improves Q over the current best.  This guarantees Joint ≥ μ-Optimized.
+
+    Uses batched evaluation for path assessment.
     """
     t0 = time.time()
     device = x.device
@@ -674,14 +666,8 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     f_x = _forward_scalar(model, x)
     target = f_x - f_bl
 
-    # Initialise path: user-provided or straight line
-    if init_path is not None:
-        assert len(init_path) == N + 1, \
-            f"init_path must have N+1={N+1} points, got {len(init_path)}"
-        gamma_pts = [p.clone() for p in init_path]
-    else:
-        gamma_pts = [baseline + (k / N) * delta_x for k in range(N + 1)]
-
+    # Initialise: straight line, uniform μ
+    gamma_pts = [baseline + (k / N) * delta_x for k in range(N + 1)]
     mu = torch.full((N,), 1.0 / N, device=device)
     Q_history = []
 
@@ -696,33 +682,19 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     best_grads = []
 
     def _evaluate_path(gp, mu_vec):
-        """Batched evaluation of a path.
-        
-        Matches _straight_line_pass convention:
-          - Gradients at γ_0, γ_1, ..., γ_{N-1}  (first N of N+1 points)
-          - f_vals: [f(γ_0), f(γ_0), f(γ_1), ..., f(γ_{N-1}), f(γ_N)]
-            (first entry duplicated so df[0] ≈ 0, backward-looking)
-          - d[k] = grad(γ_k) · (γ_{k+1} - γ_k)
-          - df[k] = f_vals[k+1] - f_vals[k]  (backward-looking for k≥1)
-          
-        Returns (d_list, df_list, f_vals, gnorms, grads, d_arr, df_arr).
-        """
-        ap = torch.cat(gp, dim=0)                          # (N+1, C, H, W)
+        """Batched evaluation of a path. Returns (d_list, df_list, f_vals, gnorms, grads, d_arr, df_arr)."""
+        ap = torch.cat(gp, dim=0)
         with torch.no_grad():
-            fa = model(ap)                                  # (N+1,)
-        pn = ap[:N]                                         # γ_0..γ_{N-1}
-        gb = _gradient_batch(model, pn)                     # (N, C, H, W)
-        sb = ap[1:] - ap[:N]                                # steps γ_{k+1}-γ_k
-        dt = (gb * sb).view(N, -1).sum(dim=1)               # d_k
+            fa = model(ap)
+        fv = fa.tolist()
+        pn = ap[:N]
+        gb = _gradient_batch(model, pn)
+        sb = ap[1:] - ap[:N]
+        dt = (gb * sb).view(N, -1).sum(dim=1)
         dl = dt.tolist()
-
-        # Match _straight_line_pass: f_vals = [f(γ_0)] + [f(γ_0)..f(γ_{N-1})] + [f(γ_N)]
-        # so that df[k] = f_vals[k+1] - f_vals[k] is backward-looking
-        f0 = fa[0].item()
-        fv = [f0] + fa.tolist()                             # N+2 entries
-        dfl = [fv[k + 1] - fv[k] for k in range(N)]
-
+        dfl = (fa[1:] - fa[:N]).tolist()
         gn = gb.view(N, -1).norm(dim=1).tolist()
+        # Clone each slice so it doesn't share memory with gb
         gr = [gb[k:k+1].clone() for k in range(N)]
         da = torch.tensor(dl, device=device)
         dfa = torch.tensor(dfl, device=device)
@@ -882,20 +854,8 @@ def load_image_and_model(device: torch.device, min_conf: float = 0.70):
 
     model = ClassLogitModel(backbone, target_class=pc).to(device).eval()
     baseline = torch.zeros_like(x)
-
-    # Extract human-readable class name from filename if possible
-    # ImageNet format: nXXXXXXXX_class_name.JPEG
-    class_name = None
-    if "/" in source:
-        fname = source.rsplit("/", 1)[-1]
-        name_part = fname.rsplit(".", 1)[0]        # strip extension
-        parts = name_part.split("_", 1)
-        if len(parts) == 2 and parts[0].startswith("n") and parts[0][1:].isdigit():
-            class_name = parts[1].replace("_", " ")
-
     info = {"source": source, "target_class": pc, "confidence": cf,
-            "model": "ResNet-50 (ImageNet pretrained)",
-            "class_name": class_name}
+            "model": "ResNet-50 (ImageNet pretrained)"}
     return model, x, baseline, info
 
 
@@ -924,19 +884,6 @@ def visualize_attributions(x, methods, info, save_path="attribution_heatmaps.png
 
     n = len(methods)
     fig, axes = plt.subplots(2, n+1, figsize=(3.6*(n+1), 7.5), facecolor="#0D0D0D")
-
-    # Build title from class name or class index
-    class_name = info.get("class_name")
-    class_id = info["target_class"]
-    if class_name:
-        label = f'"{class_name}" (class {class_id})'
-    else:
-        label = f"class {class_id}"
-    fig.suptitle(
-        f"{label}  ·  conf {info['confidence']:.1%}  ·  Δf = {delta_f:.2f}",
-        color="#E8E4DF", fontsize=12, fontfamily="monospace",
-        fontweight="bold", y=0.98,
-    )
 
     axes[0,0].imshow(img); axes[0,0].set_title("Original", color="#E8E4DF",
         fontsize=10, fontfamily="monospace"); axes[0,0].axis("off")
@@ -989,7 +936,7 @@ def visualize_attributions(x, methods, info, save_path="attribution_heatmaps.png
 # §14  EXPERIMENT RUNNER
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_experiment(N=50, device=None, min_conf=0.70, guided_init=False):
+def run_experiment(N=50, device=None, min_conf=0.70):
     if device is None:
         device = get_device()
 
@@ -1009,17 +956,13 @@ def run_experiment(N=50, device=None, min_conf=0.70, guided_init=False):
     print("─" * 56)
 
     G = 16
-    gig = guided_ig(model, x, baseline, N)
-    init_path = gig.gamma_pts if guided_init else None
-
     methods = [
         standard_ig(model, x, baseline, N),
         idgi(model, x, baseline, N),
-        gig,
+        guided_ig(model, x, baseline, N),
         mu_optimized_ig(model, x, baseline, N, tau=0.005, n_iter=300),
         joint_ig(model, x, baseline, N, G=G, n_alternating=2,
-                 tau=0.005, mu_iter=300, path_iter=G,
-                 init_path=init_path),
+                 tau=0.005, mu_iter=300, path_iter=G),
     ]
 
     for m in methods:
@@ -1051,32 +994,15 @@ if __name__ == "__main__":
     parser.add_argument("--insdel", action="store_true")
     parser.add_argument("--insdel-steps", type=int, default=100)
     parser.add_argument("--viz-insdel", action="store_true")
-    parser.add_argument("--guided-init", action="store_true",
-                        help="Initialise Joint from Guided IG path instead of straight line")
-    parser.add_argument("--region-insdel", action="store_true",
-                        help="Compute region-based insertion/deletion (SIC-style)")
-    parser.add_argument("--viz-region-insdel", action="store_true",
-                        help="Generate region-based ins/del curve plot")
-    parser.add_argument("--patch-size", type=int, default=14,
-                        help="Grid patch size for region ins/del (default: 14)")
-    parser.add_argument("--no-slic", action="store_true",
-                        help="Use grid patches instead of SLIC superpixels")
     args = parser.parse_args()
 
     device = get_device(force=args.device)
     results, methods, model, x, baseline, info = run_experiment(
-        N=args.steps, device=device, min_conf=args.min_conf,
-        guided_init=args.guided_init)
+        N=args.steps, device=device, min_conf=args.min_conf)
 
     if args.insdel or args.viz_insdel:
         run_insertion_deletion(model, x, baseline, methods,
                                n_steps=args.insdel_steps)
-
-    if args.region_insdel or args.viz_region_insdel:
-        run_region_insertion_deletion(
-            model, x, baseline, methods,
-            patch_size=args.patch_size,
-            use_slic=not args.no_slic)
 
     if args.json:
         with open(args.json, "w") as f:
@@ -1094,8 +1020,3 @@ if __name__ == "__main__":
     if args.viz_insdel:
         ipath = args.viz_path.replace(".png", "_insdel.png")
         visualize_insertion_deletion(methods, save_path=ipath)
-
-    if args.viz_region_insdel:
-        rpath = args.viz_path.replace(".png", "_region_insdel.png")
-        visualize_insertion_deletion(methods, save_path=rpath,
-                                     use_region=True)
