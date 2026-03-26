@@ -286,6 +286,7 @@ def get_device(force: Optional[str] = None) -> torch.device:
 def visualize_insertion_deletion(
     methods: list[AttributionResult],
     save_path: str = "insertion_deletion.png",
+    use_region: bool = False,
 ):
     import matplotlib
     matplotlib.use("Agg")
@@ -293,9 +294,19 @@ def visualize_insertion_deletion(
     import matplotlib.gridspec as gridspec
     import numpy as np
 
-    scored = [m for m in methods if m.insdel is not None]
+    if use_region:
+        scored = [m for m in methods if m.region_insdel is not None]
+        get_scores = lambda m: m.region_insdel
+        mode_label = "Region-based"
+        x_unit = "regions"
+    else:
+        scored = [m for m in methods if m.insdel is not None]
+        get_scores = lambda m: m.insdel
+        mode_label = "Pixel-based"
+        x_unit = "pixels"
+
     if not scored:
-        print("⚠ No insertion/deletion scores computed — skipping plot.")
+        print(f"⚠ No {mode_label.lower()} ins/del scores computed — skipping plot.")
         return None
 
     BG = "#0D0D0D"
@@ -319,7 +330,7 @@ def visualize_insertion_deletion(
     )
 
     fig.suptitle(
-        "Insertion / Deletion Evaluation  (Petsiuk et al., 2018)",
+        f"{mode_label} Insertion / Deletion Evaluation  (Petsiuk et al., 2018)",
         color=FG, fontsize=13, fontweight="bold",
         fontfamily="monospace", y=0.96,
     )
@@ -328,16 +339,17 @@ def visualize_insertion_deletion(
     ax_ins.set_facecolor(BG)
     for m in scored:
         col = method_colors.get(m.name, "#F7B538")
-        curve = m.insdel.insertion_curve
+        sc = get_scores(m)
+        curve = sc.insertion_curve
         xs = np.linspace(0, 1, len(curve))
         ax_ins.plot(xs, curve, color=col, linewidth=1.8,
-                    label=f"{m.name} (AUC={m.insdel.insertion_auc:.3f})",
+                    label=f"{m.name} (AUC={sc.insertion_auc:.3f})",
                     alpha=0.9)
 
     ax_ins.set_title("Insertion (higher AUC = better)",
                      color="#22C55E", fontsize=11, fontfamily="monospace",
                      fontweight="bold", pad=8)
-    ax_ins.set_xlabel("Fraction of pixels inserted", color=FG, fontsize=9,
+    ax_ins.set_xlabel(f"Fraction of {x_unit} inserted", color=FG, fontsize=9,
                       fontfamily="monospace")
     ax_ins.set_ylabel("Target class logit", color=FG, fontsize=9,
                       fontfamily="monospace")
@@ -353,16 +365,17 @@ def visualize_insertion_deletion(
     ax_del.set_facecolor(BG)
     for m in scored:
         col = method_colors.get(m.name, "#F7B538")
-        curve = m.insdel.deletion_curve
+        sc = get_scores(m)
+        curve = sc.deletion_curve
         xs = np.linspace(0, 1, len(curve))
         ax_del.plot(xs, curve, color=col, linewidth=1.8,
-                    label=f"{m.name} (AUC={m.insdel.deletion_auc:.3f})",
+                    label=f"{m.name} (AUC={sc.deletion_auc:.3f})",
                     alpha=0.9)
 
     ax_del.set_title("Deletion (lower AUC = better)",
                      color="#EF4444", fontsize=11, fontfamily="monospace",
                      fontweight="bold", pad=8)
-    ax_del.set_xlabel("Fraction of pixels deleted", color=FG, fontsize=9,
+    ax_del.set_xlabel(f"Fraction of {x_unit} deleted", color=FG, fontsize=9,
                       fontfamily="monospace")
     ax_del.set_ylabel("Target class logit", color=FG, fontsize=9,
                       fontfamily="monospace")
@@ -377,7 +390,7 @@ def visualize_insertion_deletion(
     ax_bar_ins = fig.add_subplot(gs[1, 0])
     ax_bar_ins.set_facecolor(BG)
     names = [m.name for m in scored]
-    ins_aucs = [m.insdel.insertion_auc for m in scored]
+    ins_aucs = [get_scores(m).insertion_auc for m in scored]
     colors = [method_colors.get(n, "#F7B538") for n in names]
 
     bars = ax_bar_ins.barh(range(len(scored)), ins_aucs,
@@ -402,7 +415,7 @@ def visualize_insertion_deletion(
 
     ax_bar_del = fig.add_subplot(gs[1, 1])
     ax_bar_del.set_facecolor(BG)
-    del_aucs = [m.insdel.deletion_auc for m in scored]
+    del_aucs = [get_scores(m).deletion_auc for m in scored]
 
     bars = ax_bar_del.barh(range(len(scored)), del_aucs,
                            color=colors, edgecolor=BG, height=0.55)

@@ -55,6 +55,7 @@ from utilss import (
     get_device, AttributionResult, StepInfo, InsDelScores,
     compute_Var_nu, compute_CV2, compute_Q, compute_all_metrics,
     compute_insertion_deletion, run_insertion_deletion,
+    compute_region_insertion_deletion, run_region_insertion_deletion,
     visualize_step_fidelity, visualize_insertion_deletion,
 )
 
@@ -1039,6 +1040,14 @@ if __name__ == "__main__":
     parser.add_argument("--viz-insdel", action="store_true")
     parser.add_argument("--guided-init", action="store_true",
                         help="Initialise Joint from Guided IG path instead of straight line")
+    parser.add_argument("--region-insdel", action="store_true",
+                        help="Compute region-based insertion/deletion (SIC-style)")
+    parser.add_argument("--viz-region-insdel", action="store_true",
+                        help="Generate region-based ins/del curve plot")
+    parser.add_argument("--patch-size", type=int, default=14,
+                        help="Grid patch size for region ins/del (default: 14)")
+    parser.add_argument("--no-slic", action="store_true",
+                        help="Use grid patches instead of SLIC superpixels")
     args = parser.parse_args()
 
     device = get_device(force=args.device)
@@ -1049,6 +1058,12 @@ if __name__ == "__main__":
     if args.insdel or args.viz_insdel:
         run_insertion_deletion(model, x, baseline, methods,
                                n_steps=args.insdel_steps)
+
+    if args.region_insdel or args.viz_region_insdel:
+        run_region_insertion_deletion(
+            model, x, baseline, methods,
+            patch_size=args.patch_size,
+            use_slic=not args.no_slic)
 
     if args.json:
         with open(args.json, "w") as f:
@@ -1066,3 +1081,8 @@ if __name__ == "__main__":
     if args.viz_insdel:
         ipath = args.viz_path.replace(".png", "_insdel.png")
         visualize_insertion_deletion(methods, save_path=ipath)
+
+    if args.viz_region_insdel:
+        rpath = args.viz_path.replace(".png", "_region_insdel.png")
+        visualize_insertion_deletion(methods, save_path=rpath,
+                                     use_region=True)
