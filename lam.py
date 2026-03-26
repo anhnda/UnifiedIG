@@ -1,6 +1,6 @@
 """
-unified_ig.py — Unified Integrated Gradients Framework (v3)
-=============================================================
+unified_ig.py — Unified Integrated Gradients Framework (v3-batched)
+=====================================================================
 
 All IG variants minimise the same objective — the Snell's law conservation
 violation:
@@ -22,11 +22,12 @@ Methods and what they optimise:
     μ-Optimised  — μ optimal         (straight line, min Var_ν(φ))
     Joint        — γ + μ optimal     (alternating minimisation)
 
-Efficiency notes:
-    • Fused _forward_and_gradient → 1 backward pass per step (not 2)
-    • φ, Δf² hoisted out of Adam loop in optimize_mu
-    • Spatial group cache in joint path optimisation
-    • Batched insertion/deletion evaluation
+Perf changes vs v3:
+    FIX 1 — _straight_line_pass batches all N interpolation points into one
+            forward and one backward call (was N sequential calls).
+    FIX 2 — optimize_path._var_of batches all N path points into one forward
+            and one backward call (was N sequential calls per _var_of,
+            called ~(1 + N) times per iteration).
 
 Usage:
     python unified_ig.py                        # single run
@@ -83,6 +84,12 @@ def _forward_scalar(model: nn.Module, x: torch.Tensor) -> float:
     return float(model(x).squeeze())
 
 
+@torch.no_grad()
+def _forward_batch(model: nn.Module, x_batch: torch.Tensor) -> torch.Tensor:
+    """f(x) for a batch.  Returns (B,) tensor on same device."""
+    return model(x_batch)
+
+
 def _forward_and_gradient(model: nn.Module, x: torch.Tensor
                           ) -> tuple[float, torch.Tensor]:
     """f(x) and ∇f(x) in ONE backward pass."""
@@ -95,10 +102,46 @@ def _forward_and_gradient(model: nn.Module, x: torch.Tensor
     return f_val, x_in.grad.detach()
 
 
+def _forward_and_gradient_batch(model: nn.Module, x_batch: torch.Tensor
+                                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched f(x) and ∇_x f(x).
+
+    Args:
+        x_batch: (B, C, H, W)
+
+    Returns:
+        f_vals: (B,) tensor of scalar outputs
+        grads:  (B, C, H, W) tensor of per-sample gradients
+
+    Uses torch.vmap-style trick: we sum all outputs and backward once,
+    but because each output depends only on its own input row the
+    cross-gradients are zero and x_in.grad gives per-sample gradients.
+    """
+    B = x_batch.shape[0]
+    with torch.enable_grad():
+        x_in = x_batch.detach().clone().requires_grad_(True)
+        model.zero_grad()
+        # model returns (B,) — one scalar per sample
+        outs = model(x_in)          # (B,)
+        f_vals = outs.detach()      # (B,)
+        outs.sum().backward()
+    return f_vals, x_in.grad.detach()
+
+
 def _gradient(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """∇f(x) only (when f value already known)."""
     with torch.enable_grad():
         x_in = x.detach().clone().requires_grad_(True)
+        model.zero_grad()
+        model(x_in).sum().backward()
+    return x_in.grad.detach()
+
+
+def _gradient_batch(model: nn.Module, x_batch: torch.Tensor) -> torch.Tensor:
+    """Batched ∇f(x).  Returns (B, C, H, W)."""
+    with torch.enable_grad():
+        x_in = x_batch.detach().clone().requires_grad_(True)
         model.zero_grad()
         model(x_in).sum().backward()
     return x_in.grad.detach()
@@ -147,40 +190,76 @@ def _pack_result(name, attr, d_list, df_list, f_vals, gnorms, mu, N,
 # ═════════════════════════════════════════════════════════════════════════════
 # §4  STRAIGHT-LINE PASS  (shared by IG, IDGI, μ-Optimised)
 #
-#     Cost: 2 forward + N fused(forward+backward) = N+2 model evaluations
+#     FIX 1: batch all N interpolation points into ONE forward + ONE backward.
+#     Old cost:  N sequential forward+backward = 2N model calls
+#     New cost:  1 batched forward+backward     = 2 model calls  (+ 2 scalar)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _straight_line_pass(model: nn.Module, x: torch.Tensor,
-                        baseline: torch.Tensor, N: int):
+                        baseline: torch.Tensor, N: int,
+                        fwd_batch_size: int = 0):
     """
     Evaluate f and ∇f at N uniformly-spaced points along the straight line.
 
+    FIX 1: All N points are stacked into a single (N, C, H, W) batch and
+    processed in one forward+backward call (or chunked if fwd_batch_size > 0
+    to limit GPU memory).
+
     Returns: (delta_x, target, grads, d_list, df_list, f_vals, gnorms)
-        grads   : list of N gradient tensors
+        grads   : list of N gradient tensors  (each (1, C, H, W))
         d_list  : list of N floats (d_k = ∇f·Δγ_k)
         df_list : list of N floats (Δf_k)
-        f_vals  : list of N+1 floats (f at each γ point)
+        f_vals  : list of N+1 floats (f at each γ point, plus f(x))
         gnorms  : list of N floats (‖∇f‖)
     """
     delta_x = x - baseline
+    step = delta_x / N                # (1, C, H, W)
+
+    # Endpoints — scalar, cheap
     f_bl = _forward_scalar(model, baseline)
     f_x = _forward_scalar(model, x)
     target = f_x - f_bl
-    step = delta_x / N
 
-    grads, d_list, gnorms = [], [], []
-    f_vals = [f_bl]
+    # Build batch of N interpolation points: γ_k = baseline + (k/N) * delta_x
+    # alphas shape (N, 1, 1, 1) for broadcasting
+    alphas = torch.arange(N, device=x.device, dtype=x.dtype).view(N, 1, 1, 1) / N
+    gamma_batch = baseline + alphas * delta_x       # (N, C, H, W)
 
-    for k in range(N):
-        gamma_k = baseline + (k / N) * delta_x
-        f_k, grad_k = _forward_and_gradient(model, gamma_k)
-        f_vals.append(f_k)
-        grads.append(grad_k)
-        d_list.append(_dot(grad_k, step))
-        gnorms.append(float(grad_k.norm()))
+    # ── Batched forward + backward ──
+    if fwd_batch_size <= 0 or fwd_batch_size >= N:
+        # Single shot
+        f_batch, grad_batch = _forward_and_gradient_batch(model, gamma_batch)
+    else:
+        # Chunked to limit VRAM
+        f_chunks, g_chunks = [], []
+        for i0 in range(0, N, fwd_batch_size):
+            i1 = min(i0 + fwd_batch_size, N)
+            fb, gb = _forward_and_gradient_batch(model, gamma_batch[i0:i1])
+            f_chunks.append(fb)
+            g_chunks.append(gb)
+        f_batch = torch.cat(f_chunks, dim=0)        # (N,)
+        grad_batch = torch.cat(g_chunks, dim=0)      # (N, C, H, W)
 
-    f_vals.append(f_x)  # reuse — no extra forward
+    # ── Unpack results ──
+    # f_vals: [f_bl, f(γ_0), f(γ_1), ..., f(γ_{N-1}), f_x]
+    #   Note: f(γ_0) = f(baseline) from the batch (may differ by FP noise
+    #   from f_bl computed separately; we use f_bl for consistency).
+    f_vals_inner = f_batch.tolist()                  # N floats
+    f_vals = [f_bl] + f_vals_inner + [f_x]
+
+    # d_k = ∇f(γ_k) · step,  for each k
+    # grad_batch is (N, C, H, W), step is (1, C, H, W)
+    d_tensor = (grad_batch * step).view(N, -1).sum(dim=1)   # (N,)
+    d_list = d_tensor.tolist()
+
+    # Δf_k = f_vals[k+1] - f_vals[k]
     df_list = [f_vals[k + 1] - f_vals[k] for k in range(N)]
+
+    # grad norms
+    gnorms = grad_batch.view(N, -1).norm(dim=1).tolist()     # N floats
+
+    # grads as list of (1, C, H, W) for downstream compatibility
+    grads = [grad_batch[k:k+1] for k in range(N)]
 
     return delta_x, target, grads, d_list, df_list, f_vals, gnorms
 
@@ -196,7 +275,8 @@ def standard_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     delta_x, target, grads, d_list, df_list, f_vals, gnorms = \
         _straight_line_pass(model, x, baseline, N)
 
-    grad_sum = sum(grads)
+    # grads[k] is (1, C, H, W) — stack and mean
+    grad_sum = torch.cat(grads, dim=0).sum(dim=0, keepdim=True)  # (1, C, H, W)
     attr = delta_x * grad_sum / N
     mu = torch.full((N,), 1.0 / N, device=x.device)
 
@@ -219,7 +299,10 @@ def idgi(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     w_sum = weights.sum()
     mu = weights / w_sum if w_sum > 1e-12 else torch.full((N,), 1.0/N, device=x.device)
 
-    wg = sum(mu[k].item() * grads[k] for k in range(N))
+    # Weighted gradient sum — grads[k] is (1, C, H, W)
+    grad_stack = torch.cat(grads, dim=0)               # (N, C, H, W)
+    mu_4d = mu.view(N, 1, 1, 1)                         # (N, 1, 1, 1)
+    wg = (mu_4d * grad_stack).sum(dim=0, keepdim=True)  # (1, C, H, W)
     attr = _rescale(delta_x * wg, target)
 
     return _pack_result("IDGI", attr, d_list, df_list, f_vals, gnorms, mu, N, t0)
@@ -231,7 +314,11 @@ def idgi(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
 
 def guided_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
               N: int = 50) -> AttributionResult:
-    """Guided IG (Kapishnikov et al., 2021).  Low-grad-first path, uniform μ."""
+    """Guided IG (Kapishnikov et al., 2021).  Low-grad-first path, uniform μ.
+
+    NOTE: This method is inherently sequential — each step depends on the
+    previous one — so it cannot be batched like the straight-line methods.
+    """
     t0 = time.time()
     device = x.device
     delta_x = x - baseline
@@ -324,7 +411,6 @@ def optimize_mu(d: torch.Tensor, delta_f: torch.Tensor,
         var_phi = (w * (phi - mean_phi) ** 2).sum()
 
         # OBJECTIVE: Var_ν(φ), NOT CV²(φ)
-        # This directly minimises the conservation law violation
         entropy = (mu * torch.log(mu + 1e-15)).sum()
         loss = var_phi + tau * entropy
 
@@ -353,7 +439,10 @@ def mu_optimized_ig(model: nn.Module, x: torch.Tensor,
     df_arr = torch.tensor(df_list, device=x.device)
     mu = optimize_mu(d_arr, df_arr, tau=tau, n_iter=n_iter)
 
-    wg = sum(mu[k].item() * grads[k] for k in range(N))
+    # Weighted gradient sum
+    grad_stack = torch.cat(grads, dim=0)               # (N, C, H, W)
+    mu_4d = mu.view(N, 1, 1, 1)
+    wg = (mu_4d * grad_stack).sum(dim=0, keepdim=True)  # (1, C, H, W)
     attr = _rescale(delta_x * wg, target)
 
     return _pack_result("μ-Optimized", attr, d_list, df_list, f_vals,
@@ -365,6 +454,11 @@ def mu_optimized_ig(model: nn.Module, x: torch.Tensor,
 #
 #     Spatial grouping for images + softmax velocity scheduling.
 #     Objective: Var_ν(φ), consistent with §8.
+#
+#     FIX 2: _var_of now batches all N path points into one forward +
+#            one backward call.
+#     Old cost per _var_of:  2N sequential model calls
+#     New cost per _var_of:  2 batched model calls
 # ═════════════════════════════════════════════════════════════════════════════
 
 _group_cache: dict = {}   # memoised spatial groups
@@ -425,6 +519,40 @@ def _build_path_2d(baseline, delta_x, V, group_map, N):
     return gamma
 
 
+def _eval_path_batched(model, gamma_pts, N, device):
+    """
+    FIX 2 — core helper: evaluate d_k, Δf_k for a path in batched calls.
+
+    Given gamma_pts (list of N+1 tensors, each (1, C, H, W)):
+      1. Batch all N+1 points → one forward call  → f_vals (N+1,)
+      2. Batch the first N points → one backward call → grads (N, C, H, W)
+      3. Compute d_k = grad_k · (γ_{k+1} - γ_k) and Δf_k = f_{k+1} - f_k
+
+    Returns: (d_vec, df_vec)  both (N,) tensors
+    """
+    # Stack all N+1 points → (N+1, C, H, W)
+    all_pts = torch.cat(gamma_pts, dim=0)               # (N+1, C, H, W)
+
+    # Forward all points in one call
+    with torch.no_grad():
+        f_all = model(all_pts)                           # (N+1,)
+
+    # Backward only the first N points (we need grads at γ_0 .. γ_{N-1})
+    pts_N = all_pts[:N]                                  # (N, C, H, W)
+    grads_N = _gradient_batch(model, pts_N)              # (N, C, H, W)
+
+    # Steps: Δγ_k = γ_{k+1} - γ_k
+    steps = all_pts[1:] - all_pts[:N]                    # (N, C, H, W)
+
+    # d_k = ∇f(γ_k) · Δγ_k   (per-sample dot product)
+    d_vec = (grads_N * steps).view(N, -1).sum(dim=1)     # (N,)
+
+    # Δf_k = f(γ_{k+1}) - f(γ_k)
+    df_vec = f_all[1:] - f_all[:N]                       # (N,)
+
+    return d_vec, df_vec
+
+
 def optimize_path(model, x, baseline, mu, N=50, G=16, patch_size=14,
                   n_iter=15, lr=0.05):
     """
@@ -432,6 +560,8 @@ def optimize_path(model, x, baseline, mu, N=50, G=16, patch_size=14,
 
     Objective: Var_ν(φ), matching optimize_mu.
     Softmax over time dim per group → normalisation built in.
+
+    FIX 2: _var_of uses _eval_path_batched (2 model calls instead of 2N).
     """
     device = x.device
     delta_x = x - baseline
@@ -443,16 +573,8 @@ def optimize_path(model, x, baseline, mu, N=50, G=16, patch_size=14,
     def _var_of(lv):
         V = torch.softmax(lv, dim=1) * N
         gp = _build_path_2d(baseline, delta_x, V, gmap, N)
-        d_v = torch.zeros(N, device=device)
-        df_v = torch.zeros(N, device=device)
-        f_prev = _forward_scalar(model, gp[0])
-        for kk in range(N):
-            grd = _gradient(model, gp[kk])
-            d_v[kk] = _dot(grd, gp[kk + 1] - gp[kk])
-            f_next = _forward_scalar(model, gp[kk + 1])
-            df_v[kk] = f_next - f_prev
-            f_prev = f_next
-        return compute_Var_nu(d_v, df_v, mu)     # ← Var_ν, NOT CV²
+        d_v, df_v = _eval_path_batched(model, gp, N, device)
+        return compute_Var_nu(d_v, df_v, mu)
 
     eps = 0.1
     for it in range(n_iter):
@@ -487,6 +609,8 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     Joint optimisation: alternating min of Var_ν(φ) over (γ, μ).
 
     Each alternating step decreases Var_ν (monotone convergence).
+
+    Uses batched evaluation for path assessment.
     """
     t0 = time.time()
     device = x.device
@@ -502,18 +626,22 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     grads = []
 
     for s in range(n_alternating):
-        # Evaluate current path
-        f_vals = [_forward_scalar(model, gamma_pts[k]) for k in range(N + 1)]
-        d_list, df_list, gnorms = [], [], []
-        grads = []
+        # ── Evaluate current path (batched) ──
+        all_pts = torch.cat(gamma_pts, dim=0)            # (N+1, C, H, W)
+        with torch.no_grad():
+            f_all = model(all_pts)                        # (N+1,)
+        f_vals = f_all.tolist()
 
-        for k in range(N):
-            grad_k = _gradient(model, gamma_pts[k])
-            grads.append(grad_k)
-            step_k = gamma_pts[k + 1] - gamma_pts[k]
-            d_list.append(_dot(grad_k, step_k))
-            df_list.append(f_vals[k + 1] - f_vals[k])
-            gnorms.append(float(grad_k.norm()))
+        pts_N = all_pts[:N]
+        grads_batch = _gradient_batch(model, pts_N)       # (N, C, H, W)
+        steps_batch = all_pts[1:] - all_pts[:N]           # (N, C, H, W)
+
+        d_tensor = (grads_batch * steps_batch).view(N, -1).sum(dim=1)
+        d_list = d_tensor.tolist()
+        df_list = (f_all[1:] - f_all[:N]).tolist()
+        gnorms = grads_batch.view(N, -1).norm(dim=1).tolist()
+        # Keep grads as list of (1, C, H, W) for final attribution
+        grads = [grads_batch[k:k+1] for k in range(N)]
 
         d_arr = torch.tensor(d_list, device=device)
         df_arr = torch.tensor(df_list, device=device)
@@ -528,16 +656,22 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
                 model, x, baseline, mu, N=N, G=G,
                 patch_size=patch_size, n_iter=path_iter)
 
-            # Re-evaluate on new path
-            f_vals = [_forward_scalar(model, gamma_pts[k]) for k in range(N+1)]
-            d_list, df_list, gnorms, grads = [], [], [], []
-            for k in range(N):
-                grad_k = _gradient(model, gamma_pts[k])
-                grads.append(grad_k)
-                step_k = gamma_pts[k + 1] - gamma_pts[k]
-                d_list.append(_dot(grad_k, step_k))
-                df_list.append(f_vals[k + 1] - f_vals[k])
-                gnorms.append(float(grad_k.norm()))
+            # Re-evaluate on new path (batched)
+            all_pts = torch.cat(gamma_pts, dim=0)
+            with torch.no_grad():
+                f_all = model(all_pts)
+            f_vals = f_all.tolist()
+
+            pts_N = all_pts[:N]
+            grads_batch = _gradient_batch(model, pts_N)
+            steps_batch = all_pts[1:] - all_pts[:N]
+
+            d_tensor = (grads_batch * steps_batch).view(N, -1).sum(dim=1)
+            d_list = d_tensor.tolist()
+            df_list = (f_all[1:] - f_all[:N]).tolist()
+            gnorms = grads_batch.view(N, -1).norm(dim=1).tolist()
+            grads = [grads_batch[k:k+1] for k in range(N)]
+
             d_arr = torch.tensor(d_list, device=device)
             df_arr = torch.tensor(df_list, device=device)
             var_path, cv2_path, Q_path = compute_all_metrics(d_arr, df_arr, mu)
@@ -775,7 +909,7 @@ def run_experiment(N=50, device=None, min_conf=0.70):
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Unified IG v3 (PyTorch)")
+    parser = argparse.ArgumentParser(description="Unified IG v3-batched (PyTorch)")
     parser.add_argument("--json", type=str, default=None)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--device", type=str, default=None)

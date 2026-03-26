@@ -14,18 +14,6 @@ import torchvision.models as models
 import torchvision.transforms as T
 
 
-import argparse
-import json
-import os
-import time
-from dataclasses import dataclass, field, asdict
-from typing import Optional
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
-import torchvision.transforms as T
 @dataclass
 class StepInfo:
     t: float
@@ -53,7 +41,7 @@ class AttributionResult:
     attributions: torch.Tensor
     Q: float
     CV2: float
-    Var_nu: float                  # ← add this
+    Var_nu: float
     steps: list[StepInfo]
     Q_history: list[dict] = field(default_factory=list)
     elapsed_s: float = 0.0
@@ -65,7 +53,7 @@ class AttributionResult:
             "name": self.name,
             "Q": self.Q,
             "CV2": self.CV2,
-            "Var_nu": self.Var_nu,   # ← add this
+            "Var_nu": self.Var_nu,
             "steps": [asdict(s) for s in self.steps],
             "Q_history": self.Q_history,
             "elapsed_s": self.elapsed_s,
@@ -91,42 +79,27 @@ def compute_insertion_deletion(
     n_steps: int = 100,
     batch_size: int = 16,
 ) -> InsDelScores:
-    """
-    Insertion and Deletion metrics (Petsiuk et al., BMVC 2018).
-
-    OPTIMISATION vs v2:
-    - All S = n_steps+1 masks are built in one vectorised broadcast:
-        ranks.unsqueeze(0) < counts.unsqueeze(1)  →  (S, H*W) bool tensor.
-      No Python loop over steps for mask construction.
-    - Two full (S, C, H, W) image batches (x_del, x_ins) are built with
-      torch.where; forward passes are batched in groups of batch_size so
-      the GPU stays busy rather than processing one image at a time.
-    - model() now returns (B,) so each batch produces a vector of logits
-      in one call.
-    """
     device   = x.device
     _, C, H, W = x.shape
     n_pixels = H * W
 
-    importance = attributions[0].abs().sum(dim=0).flatten()           # (H*W,)
+    importance = attributions[0].abs().sum(dim=0).flatten()
     sorted_idx = torch.argsort(importance, descending=True)
 
-    # Pixel rank map: ranks[p] = rank of pixel p (0 = most important)
     ranks = torch.empty(n_pixels, dtype=torch.long, device=device)
     ranks[sorted_idx] = torch.arange(n_pixels, device=device)
 
     counts  = torch.linspace(0, n_pixels, n_steps + 1,
-                             device=device).long()                     # (S,)
+                             device=device).long()
     S       = counts.shape[0]
 
-    # Build ALL boolean masks at once — no Python loop (OPT #3)
-    masks_flat = ranks.unsqueeze(0) < counts.unsqueeze(1)             # (S, H*W)
-    masks_4d   = masks_flat.view(S, 1, H, W).expand(S, C, H, W)      # (S,C,H,W)
+    masks_flat = ranks.unsqueeze(0) < counts.unsqueeze(1)
+    masks_4d   = masks_flat.view(S, 1, H, W).expand(S, C, H, W)
 
     x_exp  = x.expand(S, -1, -1, -1)
     bl_exp = baseline.expand(S, -1, -1, -1)
 
-    x_del = torch.where(masks_4d, bl_exp, x_exp)                      # (S,C,H,W)
+    x_del = torch.where(masks_4d, bl_exp, x_exp)
     x_ins = torch.where(masks_4d, x_exp,  bl_exp)
 
     del_logits = torch.empty(S, device=device)
@@ -134,7 +107,7 @@ def compute_insertion_deletion(
 
     for start in range(0, S, batch_size):
         end = min(start + batch_size, S)
-        del_logits[start:end] = model(x_del[start:end])               # (B,)
+        del_logits[start:end] = model(x_del[start:end])
         ins_logits[start:end] = model(x_ins[start:end])
 
     f_x  = float(model(x))
@@ -178,10 +151,6 @@ def run_insertion_deletion(
               f"{scores.deletion_auc:>10.4f} {diff:>10.4f}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# §4c  REGION-BASED INSERTION / DELETION  (OPT #6: cumulative mask)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _build_grid_segments(H: int, W: int, patch_size: int = 14) -> "np.ndarray":
     import numpy as np
     segments = np.zeros((H, W), dtype=int)
@@ -220,16 +189,6 @@ def compute_region_insertion_deletion(
     use_slic: bool = True,
     n_slic_segments: int = 200,
 ) -> InsDelScores:
-    """
-    Region-based Insertion/Deletion (SIC-style).
-
-    OPTIMISATION vs v2:
-    - Cumulative mask: keep a running bool tensor and OR each new region
-      in once instead of rebuilding from scratch at every step.
-      Cost goes from O(S²·pixels/S) = O(S·pixels) per-step rebuilds to
-      O(pixels/S) per step — a factor of S improvement in mask writes.
-    - model() returns (B,) so float(model(img)) squeezes cleanly.
-    """
     import numpy as np
 
     device   = x.device
@@ -251,17 +210,15 @@ def compute_region_insertion_deletion(
     insertion_curve: list[float] = []
     deletion_curve:  list[float] = []
 
-    # Step 0: empty mask
     mask_2d = torch.zeros(H, W, dtype=torch.bool, device=device)
 
     mask_4d = mask_2d.unsqueeze(0).unsqueeze(0).expand_as(x)
     insertion_curve.append(float(model(torch.where(mask_4d, x, baseline))))
     deletion_curve .append(float(model(torch.where(mask_4d, baseline, x))))
 
-    # Incremental mask update — OPT #6
     for s in range(n_segments):
         region_id = int(seg_ids[sorted_region_idx[s]])
-        mask_2d  |= (seg_tensor == region_id)                  # OR — no rebuild
+        mask_2d  |= (seg_tensor == region_id)
         mask_4d   = mask_2d.unsqueeze(0).unsqueeze(0).expand_as(x)
         insertion_curve.append(float(model(torch.where(mask_4d, x, baseline))))
         deletion_curve .append(float(model(torch.where(mask_4d, baseline, x))))
@@ -314,7 +271,6 @@ def run_region_insertion_deletion(
 
 
 def get_device(force: Optional[str] = None) -> torch.device:
-    """Select compute device. Defaults to CPU for sequential scalar ops."""
     if force:
         dev = torch.device(force)
         print(f"[device] {dev} (forced)")
@@ -331,20 +287,12 @@ def visualize_insertion_deletion(
     methods: list[AttributionResult],
     save_path: str = "insertion_deletion.png",
 ):
-    """
-    Generate insertion/deletion curve figure.
-
-    Left panel: Insertion curves (higher = better).
-    Right panel: Deletion curves (lower = better).
-    Bottom: AUC summary bar chart.
-    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
     import numpy as np
 
-    # Filter methods that have insdel scores
     scored = [m for m in methods if m.insdel is not None]
     if not scored:
         print("⚠ No insertion/deletion scores computed — skipping plot.")
@@ -376,7 +324,6 @@ def visualize_insertion_deletion(
         fontfamily="monospace", y=0.96,
     )
 
-    # ── Top-left: Insertion curves ──
     ax_ins = fig.add_subplot(gs[0, 0])
     ax_ins.set_facecolor(BG)
     for m in scored:
@@ -402,7 +349,6 @@ def visualize_insertion_deletion(
     for spine in ax_ins.spines.values():
         spine.set_color(GRID_C)
 
-    # ── Top-right: Deletion curves ──
     ax_del = fig.add_subplot(gs[0, 1])
     ax_del.set_facecolor(BG)
     for m in scored:
@@ -428,7 +374,6 @@ def visualize_insertion_deletion(
     for spine in ax_del.spines.values():
         spine.set_color(GRID_C)
 
-    # ── Bottom-left: Insertion AUC bar chart ──
     ax_bar_ins = fig.add_subplot(gs[1, 0])
     ax_bar_ins.set_facecolor(BG)
     names = [m.name for m in scored]
@@ -455,7 +400,6 @@ def visualize_insertion_deletion(
     ax_bar_ins.spines["bottom"].set_color(GRID_C)
     ax_bar_ins.spines["left"].set_color(GRID_C)
 
-    # ── Bottom-right: Deletion AUC bar chart ──
     ax_bar_del = fig.add_subplot(gs[1, 1])
     ax_bar_del.set_facecolor(BG)
     del_aucs = [m.insdel.deletion_auc for m in scored]
@@ -518,8 +462,8 @@ def visualize_step_fidelity(
         ks    = range(N)
         phis  = [s.phi_k for s in m.steps]
         mus   = [s.mu_k  for s in m.steps]
-        phis_np = __import__("numpy").array(phis)
-        mus_np  = __import__("numpy").array(mus)
+        phis_np = np.array(phis)
+        mus_np  = np.array(mus)
 
         mu_max    = max(mus_np.max(), 1e-9)
         mu_scaled = mus_np / mu_max * 2.0
@@ -527,7 +471,7 @@ def visualize_step_fidelity(
         ax.plot(ks, phis, 'o-', color=col, markersize=2.5, linewidth=1, alpha=0.9)
         ax.axhline(1.0, color="#22C55E", linestyle="--", linewidth=1, alpha=0.6)
 
-        phi_med = __import__("numpy").median(phis_np)
+        phi_med = np.median(phis_np)
         ax.set_ylim(max(phis_np.min() - 0.5, phi_med - 5),
                     min(phis_np.max() + 0.5, phi_med + 5))
         ax.set_title(f"{m.name}  (𝒬={m.Q:.4f})", color=col, fontsize=9,
@@ -546,30 +490,16 @@ def visualize_step_fidelity(
 
 def compute_Var_nu(d: torch.Tensor, delta_f: torch.Tensor,
                    mu: torch.Tensor) -> float:
-    """
-    Var_ν(φ) — the primary objective (Eq. 13).
-
-    Args:
-        d:       (N,) tensor of d_k = ∇f(γ_k) · Δγ_k
-        delta_f: (N,) tensor of Δf_k = f(γ_{k+1}) - f(γ_k)
-        mu:      (N,) tensor of attribution measure weights (sums to 1)
-
-    Returns:
-        Weighted variance of step fidelity under effective measure ν.
-    """
-    # φ_k = d_k / Δf_k  (skip steps with negligible Δf)
     valid = delta_f.abs() > 1e-12
     safe_df = torch.where(valid, delta_f, torch.ones_like(delta_f))
     phi = torch.where(valid, d / safe_df, torch.ones_like(d))
 
-    # ν_k = μ_k Δf_k² / Σ_j μ_j Δf_j²
     nu = mu * delta_f ** 2
     nu_sum = nu.sum()
     if nu_sum < 1e-15:
         return 0.0
     nu = nu / nu_sum
 
-    # Var_ν(φ) = Σ_k ν_k (φ_k - φ̄_ν)²
     phi_bar = (nu * phi).sum()
     var_nu = (nu * (phi - phi_bar) ** 2).sum()
 
@@ -578,7 +508,6 @@ def compute_Var_nu(d: torch.Tensor, delta_f: torch.Tensor,
 
 def compute_CV2(d: torch.Tensor, delta_f: torch.Tensor,
                 mu: torch.Tensor) -> float:
-    """CV²(φ) under effective measure ν_k ∝ μ_k Δf_k²."""
     valid = delta_f.abs() > 1e-12
     if valid.sum() < 2:
         return 0.0
@@ -598,7 +527,6 @@ def compute_CV2(d: torch.Tensor, delta_f: torch.Tensor,
 
 def compute_Q(d: torch.Tensor, delta_f: torch.Tensor,
               mu: torch.Tensor) -> float:
-    """𝒬 = (Σ μ_k d_k Δf_k)² / [(Σ μ_k d_k²)(Σ μ_k Δf_k²)]"""
     num = (mu * d * delta_f).sum() ** 2
     den1 = (mu * d ** 2).sum()
     den2 = (mu * delta_f ** 2).sum()
@@ -608,23 +536,10 @@ def compute_Q(d: torch.Tensor, delta_f: torch.Tensor,
 
 def compute_all_metrics(d: torch.Tensor, delta_f: torch.Tensor,
                         mu: torch.Tensor) -> tuple[float, float, float]:
-    """
-    Compute (Var_ν, CV², Q) in a single pass.
-
-    Args:
-        d:       (N,) d_k = ∇f(γ_k) · Δγ_k
-        delta_f: (N,) Δf_k = f(γ_{k+1}) - f(γ_k)
-        mu:      (N,) attribution measure (sums to 1)
-
-    Returns:
-        (Var_nu, CV2, Q)
-    """
-    # φ_k = d_k / Δf_k
     valid = delta_f.abs() > 1e-12
     safe_df = torch.where(valid, delta_f, torch.ones_like(delta_f))
     phi = torch.where(valid, d / safe_df, torch.ones_like(d))
 
-    # ν_k = μ_k Δf_k² / Σ_j μ_j Δf_j²
     nu = mu * delta_f ** 2
     nu_sum = nu.sum()
     if nu_sum < 1e-15:
@@ -632,15 +547,12 @@ def compute_all_metrics(d: torch.Tensor, delta_f: torch.Tensor,
 
     nu = nu / nu_sum
 
-    # Var_ν(φ) = Σ_k ν_k (φ_k - φ̄_ν)²
     phi_bar = (nu * phi).sum()
     var_nu = float((nu * (phi - phi_bar) ** 2).sum())
 
-    # CV²(φ) = Var_ν(φ) / φ̄²
     phi_bar_val = float(phi_bar)
     cv2 = var_nu / (phi_bar_val ** 2) if abs(phi_bar_val) > 1e-12 else 0.0
 
-    # Q = 1 / (1 + CV²)
     Q = 1.0 / (1.0 + cv2)
 
     return var_nu, cv2, Q
