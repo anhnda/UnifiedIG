@@ -553,22 +553,41 @@ def _eval_path_batched(model, gamma_pts, N, device):
     return d_vec, df_vec
 
 
-def _compute_neg_Q(d_v: torch.Tensor, df_v: torch.Tensor,
-                   mu: torch.Tensor) -> float:
+def _compute_path_obj(d_v: torch.Tensor, df_v: torch.Tensor,
+                      mu: torch.Tensor) -> float:
     """
-    Compute 1 - Q for path optimisation.
+    Path objective: MSE_ν(φ, 1) = Σ ν_k (φ_k - 1)².
 
-    Why not Var_ν?  The path changes both d_k and Δf_k, so Var_ν(φ) = 0
-    can be achieved trivially by making all φ_k equal to some constant c ≠ 1
-    (e.g., routing through flat regions where d_k ≈ 0 and Δf_k ≈ 0).
-    Q = 1/(1+CV²) penalises this because CV² = Var/φ̄² blows up when φ̄→0.
+    This equals Var_ν(φ) + (φ̄_ν - 1)² — variance plus bias-squared.
 
-    For μ-optimisation (§8), Var_ν is correct because {d_k, Δf_k} are fixed
-    and φ̄ only changes through the ν weights.  For path optimisation the
-    path itself controls the numerics, so we need the scale-aware Q metric.
+    Why not just Var_ν?
+        Path changes both d_k and Δf_k, so Var_ν = 0 is achievable by making
+        all φ_k = c for any constant c (even c = -0.6).
+
+    Why not Q (Cauchy-Schwarz)?
+        Q measures proportionality:  Q = 1 whenever d = c·Δf for any c ≠ 0.
+        A path with φ_k = -0.6 everywhere has Q = 1 but is terrible.
+
+    MSE around φ = 1 cannot be gamed: the only minimum is φ_k = 1 for all
+    steps with ν_k > 0, which is exactly the conservation law (§4.2).
+
+    For μ-optimisation (§8) the bias term is constant (path is fixed) so
+    minimising Var_ν is equivalent.  For path optimisation the bias varies,
+    so we need the full MSE.
     """
-    _, _, Q = compute_all_metrics(d_v, df_v, mu)
-    return 1.0 - Q     # minimise → maximise Q
+    valid = df_v.abs() > 1e-12
+    safe_df = torch.where(valid, df_v, torch.ones_like(df_v))
+    phi = torch.where(valid, d_v / safe_df, torch.ones_like(d_v))
+
+    nu = mu * df_v ** 2
+    nu_sum = nu.sum()
+    if nu_sum < 1e-15:
+        return 0.0
+
+    nu = nu / nu_sum
+    # MSE_ν(φ, 1) = Σ ν_k (φ_k - 1)²
+    mse = float((nu * (phi - 1.0) ** 2).sum())
+    return mse
 
 
 def optimize_path(model, x, baseline, mu, N=50, G=16, patch_size=14,
@@ -593,7 +612,7 @@ def optimize_path(model, x, baseline, mu, N=50, G=16, patch_size=14,
         V = torch.softmax(lv, dim=1) * N
         gp = _build_path_2d(baseline, delta_x, V, gmap, N)
         d_v, df_v = _eval_path_batched(model, gp, N, device)
-        return _compute_neg_Q(d_v, df_v, mu)
+        return _compute_path_obj(d_v, df_v, mu)
 
     eps = 0.1
     for it in range(n_iter):

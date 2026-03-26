@@ -543,6 +543,7 @@ def compute_all_metrics(d: torch.Tensor, delta_f: torch.Tensor,
     nu = mu * delta_f ** 2
     nu_sum = nu.sum()
     if nu_sum < 1e-15:
+        # No signal at all — can't assess fidelity
         return 0.0, 0.0, 1.0
 
     nu = nu / nu_sum
@@ -551,8 +552,13 @@ def compute_all_metrics(d: torch.Tensor, delta_f: torch.Tensor,
     var_nu = float((nu * (phi - phi_bar) ** 2).sum())
 
     phi_bar_val = float(phi_bar)
-    cv2 = var_nu / (phi_bar_val ** 2) if abs(phi_bar_val) > 1e-12 else 0.0
-
-    Q = 1.0 / (1.0 + cv2)
+    if abs(phi_bar_val) < 1e-12:
+        # φ̄ ≈ 0 means gradients are orthogonal to output change.
+        # CV² → ∞,  Q → 0.  This is a degenerate path, not a good one.
+        cv2 = float("inf") if var_nu > 1e-15 else 0.0
+        Q = 0.0 if var_nu > 1e-15 else 1.0
+    else:
+        cv2 = var_nu / (phi_bar_val ** 2)
+        Q = 1.0 / (1.0 + cv2)
 
     return var_nu, cv2, Q
