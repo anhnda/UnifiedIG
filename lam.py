@@ -704,6 +704,23 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
         d_list, df_list, f_vals, gnorms, grads, d_arr, df_arr = \
             _evaluate_path(gamma_pts, mu)
 
+        if s == 0:
+            # Compare with _straight_line_pass on the same data
+            _, _, _slp_grads, _slp_d, _slp_df, _slp_f, _slp_gn = \
+                _straight_line_pass(model, x, baseline, N)
+            _slp_d_t = torch.tensor(_slp_d, device=device)
+            _slp_df_t = torch.tensor(_slp_df, device=device)
+            _mu_slp = optimize_mu(_slp_d_t, _slp_df_t, tau=tau, n_iter=mu_iter)
+            _, _, _Q_slp = compute_all_metrics(_slp_d_t, _slp_df_t, _mu_slp)
+            _, _, _Q_ep = compute_all_metrics(d_arr, df_arr,
+                optimize_mu(d_arr, df_arr, tau=tau, n_iter=mu_iter))
+            _d_diff = (d_arr - _slp_d_t).abs().max().item()
+            _df_diff = (df_arr - _slp_df_t).abs().max().item()
+            print(f"  [diag] max|d_eval - d_slp| = {_d_diff:.8f}")
+            print(f"  [diag] max|df_eval - df_slp| = {_df_diff:.8f}")
+            print(f"  [diag] Q via _straight_line = {_Q_slp:.6f}")
+            print(f"  [diag] Q via _evaluate_path = {_Q_ep:.6f}")
+
         # Phase 1: optimise μ
         mu = optimize_mu(d_arr, df_arr, tau=tau, n_iter=mu_iter)
         var_mu, cv2_mu, Q_mu = compute_all_metrics(d_arr, df_arr, mu)
