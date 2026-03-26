@@ -758,6 +758,13 @@ def joint_ig(model: nn.Module, x: torch.Tensor, baseline: torch.Tensor,
     mu = best_mu
     grads = best_grads
 
+    # Debug: verify metrics match what the guard saw
+    _d_check = torch.tensor(best_d_list, device=device)
+    _df_check = torch.tensor(best_df_list, device=device)
+    _v, _c, _q = compute_all_metrics(_d_check, _df_check, mu)
+    print(f"  [joint] guard best_Q={best_Q:.6f}  recomputed Q={_q:.6f}  "
+          f"Var={_v:.6f}  CV2={_c:.6f}")
+
     attr = torch.zeros_like(x)
     for k in range(N):
         attr += mu[k] * grads[k] * (gamma_pts[k + 1] - gamma_pts[k])
