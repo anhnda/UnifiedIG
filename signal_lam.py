@@ -46,7 +46,7 @@ from utilss import (
 )
 
 # Import path/gradient utilities from existing unified_ig
-from unified_ig import (
+from lam import (
     _forward_scalar, _forward_batch, _forward_and_gradient,
     _forward_and_gradient_batch, _gradient, _gradient_batch,
     _dot, _rescale, _build_steps, _straight_line_pass,
@@ -610,7 +610,7 @@ def run_all_methods(
 
     Returns list: [IG, IDGI, Guided IG, μ-Optimized*, Joint(λ=0), Joint*]
     """
-    from unified_ig import standard_ig, idgi, guided_ig, joint_ig
+    from lam import standard_ig, idgi, guided_ig, joint_ig
 
     results = []
 
