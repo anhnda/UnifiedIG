@@ -647,20 +647,30 @@ def run_all_methods(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §9  EXPERIMENT RUNNER
+# §9  MAIN — demo / comparison
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_experiment(N=50, device=None, min_conf=0.70, guided_init=False,
-                   lam=1.0, tau=0.01):
-    """Full experiment: load model/image, run all 6 methods, print table."""
-    from lam import load_image_and_model
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Signal-Harvesting IG — unified variational framework")
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--lam", type=float, default=1.0,
+                        help="Signal-harvesting strength λ (0 = original LAM)")
+    parser.add_argument("--tau", type=float, default=0.01,
+                        help="L2 admissibility multiplier τ")
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--min-conf", type=float, default=0.70)
+    parser.add_argument("--guided-init", action="store_true")
+    parser.add_argument("--json", type=str, default=None)
+    args = parser.parse_args()
+
+    from lam import load_image_and_model, _forward_scalar
     from utilss import get_device
 
-    if device is None:
-        device = get_device()
-
-    print("Loading ResNet-50 and image...")
-    model, x, baseline, info = load_image_and_model(device, min_conf)
+    device = get_device(force=args.device)
+    model, x, baseline, info = load_image_and_model(device, args.min_conf)
 
     f_x = _forward_scalar(model, x)
     f_bl = _forward_scalar(model, baseline)
@@ -670,16 +680,15 @@ def run_experiment(N=50, device=None, min_conf=0.70, guided_init=False,
     print(f"Source: {info['source']}")
     print(f"Class : {info['target_class']} (conf={info['confidence']:.4f})")
     print(f"f(x) = {f_x:.4f},  f(bl) = {f_bl:.4f},  Δf = {delta_f:.4f}")
-    print(f"N = {N},  λ = {lam},  τ = {tau}\n")
+    print(f"N = {args.steps},  λ = {args.lam},  τ = {args.tau}\n")
 
     methods = run_all_methods(
-        model, x, baseline, N=N,
-        lam=lam, tau=tau,
-        guided_init=guided_init)
+        model, x, baseline, N=args.steps,
+        lam=args.lam, tau=args.tau,
+        guided_init=args.guided_init)
 
-    # ── Print table ──
-    hdr = (f"{'Method':<16} {'Var_ν':>10} {'CV²':>8} {'𝒬':>8} "
-           f"{'Obj':>10} {'Time':>8}")
+    # ── Report ──
+    hdr = f"{'Method':<16} {'Var_ν':>10} {'CV²':>8} {'𝒬':>8} {'Obj':>10} {'Time':>8}"
     print(hdr)
     print("─" * len(hdr))
 
@@ -688,110 +697,17 @@ def run_experiment(N=50, device=None, min_conf=0.70, guided_init=False,
         df_arr = torch.tensor([s.delta_f_k for s in m.steps], device=device)
         mu_arr = torch.tensor([s.mu_k for s in m.steps], device=device)
         obj, _, _, _ = compute_signal_harvesting_objective(
-            d_arr, df_arr, mu_arr, lam=lam, tau=tau)
+            d_arr, df_arr, mu_arr, lam=args.lam, tau=args.tau)
         print(f"{m.name:<16} {m.Var_nu:>10.6f} {m.CV2:>8.4f} "
               f"{m.Q:>8.4f} {obj:>10.4f} {m.elapsed_s:>7.1f}s")
 
-    results = {
-        "config": {"N": N, "lam": lam, "tau": tau},
-        "image_info": info,
-        "model_info": {"f_x": f_x, "f_baseline": f_bl,
-                       "delta_f": delta_f, "N": N, "device": str(device)},
-        "methods": {m.name: m.to_dict() for m in methods},
-    }
-    return results, methods, model, x, baseline, info
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# §10  MAIN
-# ═════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    import argparse
-    import json
-
-    parser = argparse.ArgumentParser(
-        description="Signal-Harvesting IG — unified variational framework")
-    parser.add_argument("--json", type=str, default=None,
-                        help="Export results to JSON file")
-    parser.add_argument("--steps", type=int, default=50,
-                        help="Number of interpolation steps N")
-    parser.add_argument("--lam", type=float, default=1.0,
-                        help="Signal-harvesting strength λ (0 = original LAM)")
-    parser.add_argument("--tau", type=float, default=0.01,
-                        help="L2 admissibility multiplier τ")
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--min-conf", type=float, default=0.70)
-    parser.add_argument("--guided-init", action="store_true",
-                        help="Initialise Joint/Joint* from Guided IG path")
-    # ── Visualisation flags ──
-    parser.add_argument("--viz", action="store_true",
-                        help="Generate attribution heatmap plot")
-    parser.add_argument("--viz-path", type=str,
-                        default="attribution_heatmaps.png",
-                        help="Output path for heatmap plot")
-    parser.add_argument("--viz-fidelity", action="store_true",
-                        help="Generate step-fidelity φ_k plot")
-    # ── Insertion / Deletion ──
-    parser.add_argument("--insdel", action="store_true",
-                        help="Compute pixel-based insertion/deletion AUC")
-    parser.add_argument("--insdel-steps", type=int, default=100,
-                        help="Number of steps for ins/del evaluation")
-    parser.add_argument("--viz-insdel", action="store_true",
-                        help="Generate insertion/deletion curve plot")
-    # ── Region-based Insertion / Deletion ──
-    parser.add_argument("--region-insdel", action="store_true",
-                        help="Compute region-based ins/del (SIC-style)")
-    parser.add_argument("--viz-region-insdel", action="store_true",
-                        help="Generate region-based ins/del curve plot")
-    parser.add_argument("--patch-size", type=int, default=14,
-                        help="Grid patch size for region ins/del")
-    parser.add_argument("--no-slic", action="store_true",
-                        help="Use grid patches instead of SLIC superpixels")
-    args = parser.parse_args()
-
-    from utilss import (
-        get_device, run_insertion_deletion, run_region_insertion_deletion,
-        visualize_step_fidelity, visualize_insertion_deletion,
-    )
-    from lam import visualize_attributions
-
-    device = get_device(force=args.device)
-    results, methods, model, x, baseline, info = run_experiment(
-        N=args.steps, device=device, min_conf=args.min_conf,
-        guided_init=args.guided_init, lam=args.lam, tau=args.tau)
-
-    # ── Insertion / Deletion ──
-    if args.insdel or args.viz_insdel:
-        run_insertion_deletion(model, x, baseline, methods,
-                               n_steps=args.insdel_steps)
-
-    if args.region_insdel or args.viz_region_insdel:
-        run_region_insertion_deletion(
-            model, x, baseline, methods,
-            patch_size=args.patch_size,
-            use_slic=not args.no_slic)
-
-    # ── JSON export ──
     if args.json:
+        import json
+        results = {
+            "config": {"N": args.steps, "lam": args.lam, "tau": args.tau},
+            "image_info": info,
+            "methods": {m.name: m.to_dict() for m in methods},
+        }
         with open(args.json, "w") as f:
             json.dump(results, f, indent=2)
         print(f"\nResults → {args.json}")
-
-    # ── Visualisation ──
-    if args.viz:
-        visualize_attributions(x, methods, info, save_path=args.viz_path,
-                               delta_f=results["model_info"]["delta_f"])
-
-    if args.viz_fidelity:
-        fpath = args.viz_path.replace(".png", "_fidelity.png")
-        visualize_step_fidelity(methods, save_path=fpath)
-
-    if args.viz_insdel:
-        ipath = args.viz_path.replace(".png", "_insdel.png")
-        visualize_insertion_deletion(methods, save_path=ipath)
-
-    if args.viz_region_insdel:
-        rpath = args.viz_path.replace(".png", "_region_insdel.png")
-        visualize_insertion_deletion(methods, save_path=rpath,
-                                     use_region=True)
