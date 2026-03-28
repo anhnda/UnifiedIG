@@ -709,7 +709,8 @@ def run_experiment(N=50, device=None, min_conf=0.70, guided_init=False,
 if __name__ == "__main__":
     import argparse
     import json
-
+    from utilss import set_seed
+    set_seed(42)
     parser = argparse.ArgumentParser(
         description="Signal-Harvesting IG — unified variational framework")
     parser.add_argument("--json", type=str, default=None,

@@ -575,3 +575,25 @@ def compute_all_metrics(d: torch.Tensor, delta_f: torch.Tensor,
         Q = 1.0 / (1.0 + cv2)
 
     return var_nu, cv2, Q
+
+import random
+import numpy as np
+
+def set_seed(seed=42):
+    # Python random
+    random.seed(seed)
+    
+    # NumPy
+    np.random.seed(seed)
+    
+    # PyTorch (CPU)
+    torch.manual_seed(seed)
+    
+    # PyTorch (GPU)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # multi-GPU
+    
+    # Ensure deterministic behavior (slower but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
