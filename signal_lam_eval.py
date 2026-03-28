@@ -32,7 +32,7 @@ from signal_lam import (
     _forward_scalar,
 )
 from lam import ClassLogitModel
-from utilss import get_device, set_seed
+from utilss import get_device, set_seed, compute_insertion_deletion
 
 
 def load_images_from_folder(
@@ -161,6 +161,9 @@ def run_evaluation_on_images(
         "CV2": [],
         "Obj": [],
         "Time": [],
+        "Ins_AUC": [],
+        "Del_AUC": [],
+        "Ins-Del": [],
     } for name in method_names}
 
     # Run on each image
@@ -201,7 +204,15 @@ def run_evaluation_on_images(
                 stats[m.name]["Obj"].append(obj)
                 stats[m.name]["Time"].append(m.elapsed_s)
 
-                print(f"{m.name:<16} Q={m.Q:.6f} Var_ν={m.Var_nu:.6e} Time={m.elapsed_s:.1f}s")
+                # Compute insertion/deletion scores
+                ins_del_scores = compute_insertion_deletion(
+                    model, x, baseline, m.attributions, n_steps=100
+                )
+                stats[m.name]["Ins_AUC"].append(ins_del_scores.insertion_auc)
+                stats[m.name]["Del_AUC"].append(ins_del_scores.deletion_auc)
+                stats[m.name]["Ins-Del"].append(ins_del_scores.insertion_auc - ins_del_scores.deletion_auc)
+
+                print(f"{m.name:<16} Q={m.Q:.6f} Var_ν={m.Var_nu:.6e} Ins-Del={ins_del_scores.insertion_auc - ins_del_scores.deletion_auc:.4f} Time={m.elapsed_s:.1f}s")
 
         except Exception as e:
             print(f"ERROR on image {idx+1}: {e}")
@@ -226,6 +237,12 @@ def run_evaluation_on_images(
             "Obj_std": float(np.std(stats[name]["Obj"])),
             "Time_mean": float(np.mean(stats[name]["Time"])),
             "Time_std": float(np.std(stats[name]["Time"])),
+            "Ins_AUC_mean": float(np.mean(stats[name]["Ins_AUC"])),
+            "Ins_AUC_std": float(np.std(stats[name]["Ins_AUC"])),
+            "Del_AUC_mean": float(np.mean(stats[name]["Del_AUC"])),
+            "Del_AUC_std": float(np.std(stats[name]["Del_AUC"])),
+            "Ins-Del_mean": float(np.mean(stats[name]["Ins-Del"])),
+            "Ins-Del_std": float(np.std(stats[name]["Ins-Del"])),
             "n_images": len(stats[name]["Q"]),
         }
 
@@ -234,26 +251,27 @@ def run_evaluation_on_images(
 
 def print_results_table(results: dict):
     """Print formatted results table with mean ± std."""
-    print("\n" + "="*100)
+    print("\n" + "="*140)
     print("EVALUATION RESULTS (Mean ± Std)")
-    print("="*100)
+    print("="*140)
 
-    header = f"{'Method':<16} {'Q':>18} {'Var_ν':>18} {'CV²':>18} {'Obj':>18} {'Time':>12} {'N':>5}"
+    header = f"{'Method':<16} {'Q':>18} {'Var_ν':>18} {'Ins-Del':>18} {'Ins AUC':>18} {'Del AUC':>18} {'Time':>12} {'N':>5}"
     print(header)
-    print("-"*100)
+    print("-"*140)
 
     for method_name, metrics in results.items():
         q_str = f"{metrics['Q_mean']:.4f}±{metrics['Q_std']:.4f}"
         var_str = f"{metrics['Var_nu_mean']:.2e}±{metrics['Var_nu_std']:.2e}"
-        cv2_str = f"{metrics['CV2_mean']:.4f}±{metrics['CV2_std']:.4f}"
-        obj_str = f"{metrics['Obj_mean']:.3f}±{metrics['Obj_std']:.3f}"
+        ins_del_str = f"{metrics['Ins-Del_mean']:.4f}±{metrics['Ins-Del_std']:.4f}"
+        ins_auc_str = f"{metrics['Ins_AUC_mean']:.4f}±{metrics['Ins_AUC_std']:.4f}"
+        del_auc_str = f"{metrics['Del_AUC_mean']:.4f}±{metrics['Del_AUC_std']:.4f}"
         time_str = f"{metrics['Time_mean']:.1f}±{metrics['Time_std']:.1f}s"
         n_str = f"{metrics['n_images']}"
 
-        print(f"{method_name:<16} {q_str:>18} {var_str:>18} {cv2_str:>18} "
-              f"{obj_str:>18} {time_str:>12} {n_str:>5}")
+        print(f"{method_name:<16} {q_str:>18} {var_str:>18} {ins_del_str:>18} "
+              f"{ins_auc_str:>18} {del_auc_str:>18} {time_str:>12} {n_str:>5}")
 
-    print("="*100)
+    print("="*140)
 
 
 def main():
