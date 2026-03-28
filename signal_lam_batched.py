@@ -464,15 +464,19 @@ def joint_star_ig_batched(
 # Validation: Verify Identical Results
 # ═════════════════════════════════════════════════════════════════════════════
 
-def validate_batched_implementation(model, x, baseline, N=50, G=16, lam=1.0, tau=0.01):
+def validate_batched_implementation(model, x, baseline, N=50, G=16, lam=1.0, tau=0.01,
+                                     chunk_size=4):
     """
     Verify that batched implementation produces IDENTICAL results to original.
 
     This function:
     1. Runs original joint_star_ig
-    2. Runs batched joint_star_ig_batched
+    2. Runs batched joint_star_ig_batched with chunk_size
     3. Compares Q, Var_ν, attributions, objectives
     4. Reports any differences (should be zero or within floating-point error)
+
+    Args:
+        chunk_size: Memory control for batched version (default: 4 for 23GB GPU)
     """
     from signal_lam import joint_star_ig
 
@@ -485,12 +489,13 @@ def validate_batched_implementation(model, x, baseline, N=50, G=16, lam=1.0, tau
     )
     time_orig = time.time() - t0
 
-    print("Running batched Joint*...")
+    print(f"Running batched Joint* (chunk_size={chunk_size})...")
     t0 = time.time()
     result_batched = joint_star_ig_batched(
         model, x, baseline, N=N, G=G,
         n_alternating=2, lam=lam, tau=tau,
-        mu_iter=300, path_iter=10
+        mu_iter=300, path_iter=10,
+        chunk_size=chunk_size  # FIXED: Added chunk_size parameter
     )
     time_batched = time.time() - t0
 
@@ -552,4 +557,5 @@ if __name__ == "__main__":
     model, x, baseline, info = load_image_and_model(device, min_conf=0.70)
 
     print("\nValidating batched implementation...")
-    validate_batched_implementation(model, x, baseline, N=50, G=16, lam=1.0, tau=0.01)
+    validate_batched_implementation(model, x, baseline, N=50, G=16, lam=1.0, tau=0.01,
+                                     chunk_size=4)  # Use chunk_size=4 for memory control
