@@ -696,7 +696,7 @@ def run_all_methods(
     patch_size: int = 14,
     n_alternating: int = 2,
     mu_iter: int = 300,
-    path_iter: int = 10,
+    path_iter: int = 15,
     guided_init: bool = False,
 ) -> list[AttributionResult]:
     """
