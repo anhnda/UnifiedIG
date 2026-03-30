@@ -460,6 +460,9 @@ def optimize_path_signal_harvesting(
                 V[g, k0:k1] += eps * z
                 obj_plus = _obj_of(V)
                 V[g, k0:k1] -= eps * z
+                grad_V[g, k0:k1] = ((obj_plus - obj) / eps) * z
+                grad_norms_per_group.append(float(grad_V[g].norm()))
+
 
         V = V - lr * grad_V
         V = torch.clamp(V, min=0.01)
