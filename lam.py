@@ -1039,7 +1039,7 @@ def visualize_attributions(x, methods, info, save_path="attribution_heatmaps.png
         ax = axes[0, i+1]
         ax.imshow(img_dark); ax.imshow(sal, cmap=cmap, vmin=0, vmax=1, alpha=0.85)
         c = colors.get(m.name, "#F7B538")
-        ax.set_title(f"{m.name}\n𝒬={m.Q:.4f}  Var={m.Var_nu:.4f}",
+        ax.set_title(f"{m.name}\nQ={m.Q:.4f}  Var={m.Var_nu:.4f}",
                      color=c, fontsize=9, fontfamily="monospace", linespacing=1.4)
         ax.axis("off")
 
