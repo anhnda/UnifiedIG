@@ -335,66 +335,66 @@ def _signal_harvesting_path_obj(
 #     with the signal-harvesting path objective.
 # ═════════════════════════════════════════════════════════════════════════════
 
-def optimize_path_signal_harvesting(
-    model: nn.Module,
-    x: torch.Tensor,
-    baseline: torch.Tensor,
-    mu: torch.Tensor,
-    N: int = 50,
-    G: int = 16,
-    patch_size: int = 14,
-    n_iter: int = 15,
-    lr: float = 0.08,
-    lam: float = 1.0,
-):
-    """
-    Optimise path via grouped spatial velocity scheduling under the
-    signal-harvesting objective.
+# def optimize_path_signal_harvesting(
+#     model: nn.Module,
+#     x: torch.Tensor,
+#     baseline: torch.Tensor,
+#     mu: torch.Tensor,
+#     N: int = 50,
+#     G: int = 16,
+#     patch_size: int = 14,
+#     n_iter: int = 15,
+#     lr: float = 0.08,
+#     lam: float = 1.0,
+# ):
+#     """
+#     Optimise path via grouped spatial velocity scheduling under the
+#     signal-harvesting objective.
 
-    Objective per probe:
-        MSE_ν(φ,1) − λ Σ_k μ_k |d_k|
+#     Objective per probe:
+#         MSE_ν(φ,1) − λ Σ_k μ_k |d_k|
 
-    The −λΣμ|d| term creates a forcing that biases the path toward
-    concentrating output change into steps where μ is large — matching
-    the Euler-Lagrange forcing term in Eq. 16.
+#     The −λΣμ|d| term creates a forcing that biases the path toward
+#     concentrating output change into steps where μ is large — matching
+#     the Euler-Lagrange forcing term in Eq. 16.
 
-    Stochastic FD: one random time step per group per iteration.
-    Cost: O(G) batched model evaluations per iteration.
-    """
-    device = x.device
-    delta_x = x - baseline
-    gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+#     Stochastic FD: one random time step per group per iteration.
+#     Cost: O(G) batched model evaluations per iteration.
+#     """
+#     device = x.device
+#     delta_x = x - baseline
+#     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
 
-    # Initialise: uniform velocity = straight line
-    V = torch.ones(G, N, device=device)
-    best_obj = float("inf")
-    best_V = V.clone()
+#     # Initialise: uniform velocity = straight line
+#     V = torch.ones(G, N, device=device)
+#     best_obj = float("inf")
+#     best_V = V.clone()
 
-    def _obj_of(Vm):
-        gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
-        d_v, df_v = _eval_path_batched(model, gp, N, device)
-        return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
+#     def _obj_of(Vm):
+#         gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
+#         d_v, df_v = _eval_path_batched(model, gp, N, device)
+#         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
 
-    eps = 0.05
-    for it in range(n_iter):
-        obj = _obj_of(V)
-        if obj < best_obj:
-            best_obj = obj
-            best_V = V.clone()
+#     eps = 0.05
+#     for it in range(n_iter):
+#         obj = _obj_of(V)
+#         if obj < best_obj:
+#             best_obj = obj
+#             best_V = V.clone()
 
-        # Stochastic FD: perturb one random time step per group
-        grad_V = torch.zeros_like(V)
-        for g in range(G):
-            k = torch.randint(0, N, (1,)).item()
-            V[g, k] += eps
-            obj_plus = _obj_of(V)
-            grad_V[g, k] = (obj_plus - obj) / eps
-            V[g, k] -= eps
+#         # Stochastic FD: perturb one random time step per group
+#         grad_V = torch.zeros_like(V)
+#         for g in range(G):
+#             k = torch.randint(0, N, (1,)).item()
+#             V[g, k] += eps
+#             obj_plus = _obj_of(V)
+#             grad_V[g, k] = (obj_plus - obj) / eps
+#             V[g, k] -= eps
 
-        V = V - lr * grad_V
-        V = torch.clamp(V, min=0.01)
+#         V = V - lr * grad_V
+#         V = torch.clamp(V, min=0.01)
 
-    return _build_path_2d(baseline, delta_x, best_V, gmap, N)
+#     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
 # Seem to be good
 # def optimize_path_signal_harvesting(
@@ -1031,83 +1031,83 @@ def optimize_path_signal_harvesting(
 
 #     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
-# def optimize_path_signal_harvesting(
-#     model, x, baseline, mu, N=50, G=16, patch_size=14,
-#     n_iter=30, lr=0.02, lam=1.0,
-# ):
-#     device = x.device
-#     delta_x = x - baseline
-#     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
-#     gmap_flat = gmap.flatten()
-#     _, C, H, W = baseline.shape
+def optimize_path_signal_harvesting(
+    model, x, baseline, mu, N=50, G=16, patch_size=14,
+    n_iter=30, lr=0.02, lam=1.0,
+):
+    device = x.device
+    delta_x = x - baseline
+    gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+    gmap_flat = gmap.flatten()
+    _, C, H, W = baseline.shape
 
-#     # Learnable parameter
-#     V_logits = torch.zeros(G, N, device=device, requires_grad=True)
-#     optimizer = torch.optim.Adam([V_logits], lr=lr)
+    # Learnable parameter
+    V_logits = torch.zeros(G, N, device=device, requires_grad=True)
+    optimizer = torch.optim.Adam([V_logits], lr=lr)
 
-#     best_obj = float("inf")
-#     best_V = None
+    best_obj = float("inf")
+    best_V = None
 
-#     for it in range(n_iter):
-#         optimizer.zero_grad()
+    for it in range(n_iter):
+        optimizer.zero_grad()
 
-#         # Softplus ensures V > 0 without hard clamping (differentiable)
-#         V = F.softplus(V_logits)
-#         v_sums = V.sum(dim=1, keepdim=True).clamp(min=1e-12)
-#         W_norm = V / v_sums                          # (G, N)
+        # Softplus ensures V > 0 without hard clamping (differentiable)
+        V = F.softplus(V_logits)
+        v_sums = V.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        W_norm = V / v_sums                          # (G, N)
 
-#         pixel_weights = W_norm.T[:, gmap_flat]        # (N, H*W)
-#         pixel_weights = pixel_weights.view(N, 1, H, W)
+        pixel_weights = W_norm.T[:, gmap_flat]        # (N, H*W)
+        pixel_weights = pixel_weights.view(N, 1, H, W)
 
-#         steps = delta_x * pixel_weights               # (N, C, H, W)
-#         cum = torch.cumsum(steps, dim=0)
-#         gamma_stack = torch.cat([baseline, baseline + cum], dim=0)  # (N+1, C, H, W)
+        steps = delta_x * pixel_weights               # (N, C, H, W)
+        cum = torch.cumsum(steps, dim=0)
+        gamma_stack = torch.cat([baseline, baseline + cum], dim=0)  # (N+1, C, H, W)
 
-#         # Forward through model — IN the graph
-#         with torch.enable_grad():
-#             f_all = model(gamma_stack)                 # (N+1,)
+        # Forward through model — IN the graph
+        with torch.enable_grad():
+            f_all = model(gamma_stack)                 # (N+1,)
 
-#         # Gradients at first N points
-#         pts_N = gamma_stack[:N]
-#         grads_N = torch.autograd.grad(
-#             f_all[:N].sum(), gamma_stack,
-#             create_graph=True
-#         )[0][:N]                                       # (N, C, H, W)
+        # Gradients at first N points
+        pts_N = gamma_stack[:N]
+        grads_N = torch.autograd.grad(
+            f_all[:N].sum(), gamma_stack,
+            create_graph=True
+        )[0][:N]                                       # (N, C, H, W)
 
-#         step_vecs = gamma_stack[1:] - gamma_stack[:N]
-#         d_v = (grads_N * step_vecs).view(N, -1).sum(dim=1)
+        step_vecs = gamma_stack[1:] - gamma_stack[:N]
+        d_v = (grads_N * step_vecs).view(N, -1).sum(dim=1)
 
-#         f_ext = torch.cat([f_all[0:1], f_all])
-#         df_v = f_ext[1:N+1] - f_ext[:N]
+        f_ext = torch.cat([f_all[0:1], f_all])
+        df_v = f_ext[1:N+1] - f_ext[:N]
 
-#         # Objective: MSE_ν(φ,1) - λ Σ μ_k |d_k|
-#         valid = df_v.abs() > 1e-12
-#         safe_df = torch.where(valid, df_v, torch.ones_like(df_v))
-#         phi = torch.where(valid, d_v / safe_df, torch.ones_like(d_v))
+        # Objective: MSE_ν(φ,1) - λ Σ μ_k |d_k|
+        valid = df_v.abs() > 1e-12
+        safe_df = torch.where(valid, df_v, torch.ones_like(df_v))
+        phi = torch.where(valid, d_v / safe_df, torch.ones_like(d_v))
 
-#         nu = mu * df_v ** 2
-#         nu = nu / nu.sum().clamp(min=1e-15)
-#         mse = (nu * (phi - 1.0) ** 2).sum()
-#         signal = (mu * d_v.abs()).sum()
-#         loss = mse - lam * signal
+        nu = mu * df_v ** 2
+        nu = nu / nu.sum().clamp(min=1e-15)
+        mse = (nu * (phi - 1.0) ** 2).sum()
+        signal = (mu * d_v.abs()).sum()
+        loss = mse - lam * signal
 
-#         loss.backward()
-#         optimizer.step()
+        loss.backward()
+        optimizer.step()
 
-#         with torch.no_grad():
-#             if loss.item() < best_obj:
-#                 best_obj = loss.item()
-#                 best_V = F.softplus(V_logits).detach().clone()
+        with torch.no_grad():
+            if loss.item() < best_obj:
+                best_obj = loss.item()
+                best_V = F.softplus(V_logits).detach().clone()
 
-#     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
-# ═════════════════════════════════════════════════════════════════════════════
-# §7  JOINT* OPTIMISATION  (Algorithm 1 — Full Signal-Harvesting Solution)
-#
-#     Alternating minimisation of (Eq. 20):
-#       Phase 1 (measure): fix γ, optimise μ via Eq. 24
-#       Phase 2 (path):    fix μ, optimise γ via velocity scheduling
-#       Each phase monotonically decreases the objective.
-# ═════════════════════════════════════════════════════════════════════════════
+    return _build_path_2d(baseline, delta_x, best_V, gmap, N)
+═════════════════════════════════════════════════════════════════════════════
+§7  JOINT* OPTIMISATION  (Algorithm 1 — Full Signal-Harvesting Solution)
+
+    Alternating minimisation of (Eq. 20):
+      Phase 1 (measure): fix γ, optimise μ via Eq. 24
+      Phase 2 (path):    fix μ, optimise γ via velocity scheduling
+      Each phase monotonically decreases the objective.
+═════════════════════════════════════════════════════════════════════════════
 
 def joint_star_ig(
     model: nn.Module,
