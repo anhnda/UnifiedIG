@@ -397,194 +397,92 @@ def _signal_harvesting_path_obj(
 #     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
 # Seem to be good
-# def optimize_path_signal_harvesting(
-#     model: nn.Module,
-#     x: torch.Tensor,
-#     baseline: torch.Tensor,
-#     mu: torch.Tensor,
-#     N: int = 50,
-#     G: int = 16,
-#     patch_size: int = 14,
-#     n_iter: int = 25,
-#     lr: float = 0.08,
-#     lam: float = 1.0,
-#     early_stop_patience: int = 10,
-#     early_stop_rtol: float = 0.01,
-#     verbose: bool = True,
-# ):
-#     device = x.device
-#     delta_x = x - baseline
-#     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
-
-#     V = torch.ones(G, N, device=device)
-#     best_obj = float("inf")
-#     best_V = V.clone()
-
-#     def _obj_of(Vm):
-#         gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
-#         d_v, df_v = _eval_path_batched(model, gp, N, device)
-#         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
-
-#     eps = 0.05
-#     stale_count = 0
-#     prev_best = float("inf")
-#     obj_history = []
-#     block_size = 5
-#     for it in range(n_iter):
-#         t_it = time.time()
-#         obj = _obj_of(V)
-#         improved = False
-
-#         if obj < best_obj:
-#             best_obj = obj
-#             best_V = V.clone()
-#             improved = True
-
-#         # Stochastic FD: perturb one random time step per group
-#         grad_V = torch.zeros_like(V)
-#         grad_norms_per_group = []
-#         # for g in range(G):
-#         #     k = torch.randint(0, N, (1,)).item()
-#         #     V[g, k] += eps
-#         #     obj_plus = _obj_of(V)
-#         #     grad_V[g, k] = (obj_plus - obj) / eps
-#         #     V[g, k] -= eps
-#         #     grad_norms_per_group.append(abs(grad_V[g, k].item()))
-#         for g in range(G):
-#                 # Random block start
-#                 k0 = torch.randint(0, N - block_size + 1, (1,)).item()
-#                 k1 = k0 + block_size
-                
-#                 # Perturb the block with a structured pattern
-#                 z = torch.randn(block_size, device=device)
-#                 z = z / z.norm() * block_size**0.5  # scale so per-element magnitude ~ eps
-                
-#                 V[g, k0:k1] += eps * z
-#                 obj_plus = _obj_of(V)
-#                 V[g, k0:k1] -= eps * z
-#                 grad_V[g, k0:k1] = ((obj_plus - obj) / eps) * z
-#                 grad_norms_per_group.append(float(grad_V[g].norm()))
-
-
-#         V = V - lr * grad_V
-#         V = torch.clamp(V, min=0.01)
-
-#         dt = time.time() - t_it
-#         grad_norm = float(grad_V.norm())
-#         obj_history.append(best_obj)
-
-#         if verbose:
-#             mean_g = sum(grad_norms_per_group) / len(grad_norms_per_group)
-#             max_g = max(grad_norms_per_group)
-#             print(f"  path_opt iter {it:2d}/{n_iter}  "
-#                   f"obj={obj:+.6f}  best={best_obj:+.6f}  "
-#                   f"|∇V|={grad_norm:.4f}  "
-#                   f"mean/max_g={mean_g:.4f}/{max_g:.4f}  "
-#                   f"{'✓' if improved else ' '}  {dt:.2f}s")
-
-#         # Early stopping: check if best_obj has stagnated
-#         if abs(prev_best) > 1e-12:
-#             rel_change = abs(prev_best - best_obj) / abs(prev_best)
-#         else:
-#             rel_change = abs(prev_best - best_obj)
-
-#         if rel_change < early_stop_rtol:
-#             stale_count += 1
-#         else:
-#             stale_count = 0
-#         prev_best = best_obj
-
-#         if stale_count >= early_stop_patience:
-#             if verbose:
-#                 print(f"  ⚡ Early stop at iter {it}: "
-#                       f"no improvement > {early_stop_rtol:.1%} "
-#                       f"for {early_stop_patience} iters")
-#             break
-
-#     if verbose:
-#         print(f"  path_opt done: {len(obj_history)} iters, "
-#               f"obj {obj_history[0]:+.4f} → {best_obj:+.4f}  "
-#               f"(Δ={obj_history[0] - best_obj:+.4f})")
-#     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
-
-
-
 def optimize_path_signal_harvesting(
-    model, x, baseline, mu, N=50, G=16, patch_size=14,
-    n_iter=15, lr=0.002, lam=1.0,
-    momentum=0.5, n_basis=15,
-    early_stop_patience=10, early_stop_rtol=0.01, verbose=True,
+    model: nn.Module,
+    x: torch.Tensor,
+    baseline: torch.Tensor,
+    mu: torch.Tensor,
+    N: int = 50,
+    G: int = 16,
+    patch_size: int = 14,
+    n_iter: int = 25,
+    lr: float = 0.08,
+    lam: float = 1.0,
+    early_stop_patience: int = 10,
+    early_stop_rtol: float = 0.01,
+    verbose: bool = True,
 ):
     device = x.device
     delta_x = x - baseline
     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
 
-    basis = torch.stack([
-        torch.cos(torch.arange(N, device=device, dtype=torch.float32) * j * 3.14159 / N)
-        for j in range(n_basis)
-    ])
-    basis = basis / basis.norm(dim=1, keepdim=True)
-
-    A = torch.zeros(G, n_basis, device=device)
-    A[:, 0] = basis[0].sum()
-
+    V = torch.ones(G, N, device=device)
     best_obj = float("inf")
-    best_A = A.clone()
-    vel_A = torch.zeros_like(A)
+    best_V = V.clone()
 
-    def _V_from_A(Am):
-        return torch.clamp(Am @ basis, min=0.01)
-
-    def _obj_of(Am):
-        V = _V_from_A(Am)
-        gp = _build_path_2d(baseline, delta_x, V, gmap, N)
+    def _obj_of(Vm):
+        gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
         d_v, df_v = _eval_path_batched(model, gp, N, device)
         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
 
-    eps = 0.01
+    eps = 0.05
     stale_count = 0
     prev_best = float("inf")
     obj_history = []
-    restarted = False
-
+    block_size = 5
     for it in range(n_iter):
         t_it = time.time()
-        obj = _obj_of(A)
-        improved = obj < best_obj
-        if improved:
+        obj = _obj_of(V)
+        improved = False
+
+        if obj < best_obj:
             best_obj = obj
-            best_A = A.clone()
+            best_V = V.clone()
+            improved = True
 
-        grad_A = torch.zeros_like(A)
+        # Stochastic FD: perturb one random time step per group
+        grad_V = torch.zeros_like(V)
         grad_norms_per_group = []
+        # for g in range(G):
+        #     k = torch.randint(0, N, (1,)).item()
+        #     V[g, k] += eps
+        #     obj_plus = _obj_of(V)
+        #     grad_V[g, k] = (obj_plus - obj) / eps
+        #     V[g, k] -= eps
+        #     grad_norms_per_group.append(abs(grad_V[g, k].item()))
         for g in range(G):
-            j = torch.randint(0, n_basis, (1,)).item()
-            A[g, j] += eps
-            obj_plus = _obj_of(A)
-            grad_A[g, j] = (obj_plus - obj) / eps
-            A[g, j] -= eps
-            grad_norms_per_group.append(float(grad_A[g].norm()))
+                # Random block start
+                k0 = torch.randint(0, N - block_size + 1, (1,)).item()
+                k1 = k0 + block_size
+                
+                # Perturb the block with a structured pattern
+                z = torch.randn(block_size, device=device)
+                z = z / z.norm() * block_size**0.5  # scale so per-element magnitude ~ eps
+                
+                V[g, k0:k1] += eps * z
+                obj_plus = _obj_of(V)
+                V[g, k0:k1] -= eps * z
+                grad_V[g, k0:k1] = ((obj_plus - obj) / eps) * z
+                grad_norms_per_group.append(float(grad_V[g].norm()))
 
-        # Normalize gradient to have unit norm, then scale by lr
-        grad_norm = grad_A.norm()
-        if grad_norm > 1e-8:
-            grad_A = grad_A / grad_norm
 
-        vel_A = momentum * vel_A + grad_A
-        A = A - lr * vel_A
+        V = V - lr * grad_V
+        V = torch.clamp(V, min=0.01)
 
         dt = time.time() - t_it
+        grad_norm = float(grad_V.norm())
         obj_history.append(best_obj)
 
         if verbose:
-            V_now = _V_from_A(A)
+            mean_g = sum(grad_norms_per_group) / len(grad_norms_per_group)
+            max_g = max(grad_norms_per_group)
             print(f"  path_opt iter {it:2d}/{n_iter}  "
                   f"obj={obj:+.6f}  best={best_obj:+.6f}  "
-                  f"|∇A|={float(grad_norm):.4f}  "
-                  f"|vel|={float(vel_A.norm()):.4f}  "
-                  f"V=[{float(V_now.min()):.2f},{float(V_now.max()):.2f}]  "
+                  f"|∇V|={grad_norm:.4f}  "
+                  f"mean/max_g={mean_g:.4f}/{max_g:.4f}  "
                   f"{'✓' if improved else ' '}  {dt:.2f}s")
 
+        # Early stopping: check if best_obj has stagnated
         if abs(prev_best) > 1e-12:
             rel_change = abs(prev_best - best_obj) / abs(prev_best)
         else:
@@ -596,15 +494,6 @@ def optimize_path_signal_harvesting(
             stale_count = 0
         prev_best = best_obj
 
-        if stale_count == early_stop_patience // 2 and not restarted:
-            if verbose:
-                print(f"  🔄 Restart from best_A at iter {it}")
-            A = best_A.clone()
-            vel_A = torch.zeros_like(A)
-            stale_count = 0
-            restarted = True
-            continue
-
         if stale_count >= early_stop_patience:
             if verbose:
                 print(f"  ⚡ Early stop at iter {it}: "
@@ -613,14 +502,125 @@ def optimize_path_signal_harvesting(
             break
 
     if verbose:
-        n_params = G * n_basis
         print(f"  path_opt done: {len(obj_history)} iters, "
-              f"{n_params} params (G={G} × basis={n_basis}), "
               f"obj {obj_history[0]:+.4f} → {best_obj:+.4f}  "
               f"(Δ={obj_history[0] - best_obj:+.4f})")
+    return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
-    V = _V_from_A(best_A)
-    return _build_path_2d(baseline, delta_x, V, gmap, N)
+
+#Somehow low-rank is  better *compatative* than Gauss bump
+# def optimize_path_signal_harvesting(
+#     model, x, baseline, mu, N=50, G=16, patch_size=14,
+#     n_iter=15, lr=0.002, lam=1.0,
+#     momentum=0.5, n_basis=15,
+#     early_stop_patience=10, early_stop_rtol=0.01, verbose=True,
+# ):
+#     device = x.device
+#     delta_x = x - baseline
+#     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+
+#     basis = torch.stack([
+#         torch.cos(torch.arange(N, device=device, dtype=torch.float32) * j * 3.14159 / N)
+#         for j in range(n_basis)
+#     ])
+#     basis = basis / basis.norm(dim=1, keepdim=True)
+
+#     A = torch.zeros(G, n_basis, device=device)
+#     A[:, 0] = basis[0].sum()
+
+#     best_obj = float("inf")
+#     best_A = A.clone()
+#     vel_A = torch.zeros_like(A)
+
+#     def _V_from_A(Am):
+#         return torch.clamp(Am @ basis, min=0.01)
+
+#     def _obj_of(Am):
+#         V = _V_from_A(Am)
+#         gp = _build_path_2d(baseline, delta_x, V, gmap, N)
+#         d_v, df_v = _eval_path_batched(model, gp, N, device)
+#         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
+
+#     eps = 0.01
+#     stale_count = 0
+#     prev_best = float("inf")
+#     obj_history = []
+#     restarted = False
+
+#     for it in range(n_iter):
+#         t_it = time.time()
+#         obj = _obj_of(A)
+#         improved = obj < best_obj
+#         if improved:
+#             best_obj = obj
+#             best_A = A.clone()
+
+#         grad_A = torch.zeros_like(A)
+#         grad_norms_per_group = []
+#         for g in range(G):
+#             j = torch.randint(0, n_basis, (1,)).item()
+#             A[g, j] += eps
+#             obj_plus = _obj_of(A)
+#             grad_A[g, j] = (obj_plus - obj) / eps
+#             A[g, j] -= eps
+#             grad_norms_per_group.append(float(grad_A[g].norm()))
+
+#         # Normalize gradient to have unit norm, then scale by lr
+#         grad_norm = grad_A.norm()
+#         if grad_norm > 1e-8:
+#             grad_A = grad_A / grad_norm
+
+#         vel_A = momentum * vel_A + grad_A
+#         A = A - lr * vel_A
+
+#         dt = time.time() - t_it
+#         obj_history.append(best_obj)
+
+#         if verbose:
+#             V_now = _V_from_A(A)
+#             print(f"  path_opt iter {it:2d}/{n_iter}  "
+#                   f"obj={obj:+.6f}  best={best_obj:+.6f}  "
+#                   f"|∇A|={float(grad_norm):.4f}  "
+#                   f"|vel|={float(vel_A.norm()):.4f}  "
+#                   f"V=[{float(V_now.min()):.2f},{float(V_now.max()):.2f}]  "
+#                   f"{'✓' if improved else ' '}  {dt:.2f}s")
+
+#         if abs(prev_best) > 1e-12:
+#             rel_change = abs(prev_best - best_obj) / abs(prev_best)
+#         else:
+#             rel_change = abs(prev_best - best_obj)
+
+#         if rel_change < early_stop_rtol:
+#             stale_count += 1
+#         else:
+#             stale_count = 0
+#         prev_best = best_obj
+
+#         if stale_count == early_stop_patience // 2 and not restarted:
+#             if verbose:
+#                 print(f"  🔄 Restart from best_A at iter {it}")
+#             A = best_A.clone()
+#             vel_A = torch.zeros_like(A)
+#             stale_count = 0
+#             restarted = True
+#             continue
+
+#         if stale_count >= early_stop_patience:
+#             if verbose:
+#                 print(f"  ⚡ Early stop at iter {it}: "
+#                       f"no improvement > {early_stop_rtol:.1%} "
+#                       f"for {early_stop_patience} iters")
+#             break
+
+#     if verbose:
+#         n_params = G * n_basis
+#         print(f"  path_opt done: {len(obj_history)} iters, "
+#               f"{n_params} params (G={G} × basis={n_basis}), "
+#               f"obj {obj_history[0]:+.4f} → {best_obj:+.4f}  "
+#               f"(Δ={obj_history[0] - best_obj:+.4f})")
+
+#     V = _V_from_A(best_A)
+#     return _build_path_2d(baseline, delta_x, V, gmap, N)
 
 # Good with Gauss bump
 # def optimize_path_signal_harvesting(
