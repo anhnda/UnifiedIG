@@ -604,12 +604,10 @@ def _build_path_2d(baseline, delta_x, V, group_map, N):
     v_sums = V.sum(dim=1, keepdim=True).clamp(min=1e-12)
     W_norm = V / v_sums                                          # (G, N)
 
-    # Gather per-pixel weight for each time step
     gmap_flat = group_map.flatten()                               # (H*W,)
     weights = W_norm.T                                            # (N, G)
     pixel_weights = weights[:, gmap_flat]                         # (N, H*W)
 
-    # Expand spatial weights to cover channels: (N, 1, H, W) → broadcast with (C, H, W)
     _, C, H, W = baseline.shape
     pixel_weights = pixel_weights.view(N, 1, H, W)               # (N, 1, H, W)
 
@@ -617,7 +615,7 @@ def _build_path_2d(baseline, delta_x, V, group_map, N):
     cum = torch.cumsum(steps, dim=0)                              # (N, C, H, W)
 
     gamma_stack = torch.cat([baseline, baseline + cum], dim=0)    # (N+1, C, H, W)
-    return list(gamma_stack.unbind(0))
+    return list(gamma_stack.split(1, dim=0))                      # list of (1, C, H, W)
 
 def _eval_path_batched(model, gamma_pts, N, device):
     """
