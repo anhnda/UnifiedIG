@@ -39,6 +39,8 @@ from utility import (
     AttributionResult,
     compute_insertion_deletion,
     get_device,
+    set_seed,
+    load_image,
 )
 
 
@@ -188,6 +190,169 @@ def run_method(
         raise ValueError(f"Unknown method: {method_name}")
 
 
+def compare_methods_batch(
+    model_name: str = 'resnet50',
+    methods: list[str] = None,
+    metrics: list[str] = None,
+    N: int = 50,
+    n_test: int = 30,
+    min_conf: float = 0.70,
+    device: Optional[str] = None,
+    seed: int = 42,
+    json_path: Optional[str] = None,
+):
+    """
+    Compare attribution methods on multiple images with mean±std reporting.
+
+    Args:
+        model_name: Model to use ('resnet50', 'vgg16', 'densenet121', 'vit_b_16')
+        methods: List of methods to compare
+        metrics: List of metrics to compute
+        N: Number of interpolation steps
+        n_test: Number of test images
+        min_conf: Minimum classification confidence
+        device: Device to use (None for auto)
+        seed: Random seed for reproducibility
+        json_path: Path to save JSON results (optional)
+
+    Returns:
+        Dictionary with aggregated results
+    """
+    import numpy as np
+    import json as json_module
+
+    # Set random seed for reproducibility
+    set_seed(seed)
+
+    # Default methods and metrics
+    if methods is None:
+        methods = ['ig', 'idig', 'guided_ig', 'lig']
+    if metrics is None:
+        metrics = ['insertion', 'deletion', 'ins-del']
+
+    # Setup device
+    dev = get_device(force=device)
+
+    # Load model once
+    backbone = load_model(model_name, dev)
+
+    print(f"\n{'='*70}")
+    print(f"Batch Testing: {n_test} images, {len(methods)} methods, N={N} steps")
+    print(f"{'='*70}\n")
+
+    # Storage for all results
+    all_results = {method: {
+        'Q': [], 'Var_nu': [], 'CV2': [],
+        'insertion_auc': [], 'deletion_auc': [], 'ins_del': [],
+        'time': []
+    } for method in methods}
+
+    image_info_list = []
+
+    # Run on n_test images
+    for img_idx in range(n_test):
+        print(f"\n--- Image {img_idx + 1}/{n_test} ---")
+
+        # Load image
+        x, target_class, confidence, source, class_name = load_image(
+            backbone, dev, min_conf=min_conf, skip=img_idx)
+
+        image_info_list.append({
+            'index': img_idx,
+            'source': source,
+            'target_class': int(target_class),
+            'confidence': float(confidence),
+            'class_name': class_name,
+        })
+
+        # Wrap model
+        model = ClassLogitModel(backbone, target_class)
+        baseline = torch.zeros_like(x)
+
+        # Run each method
+        for method_name in methods:
+            try:
+                result = run_method(method_name, model, x, baseline, N=N)
+
+                # Store metrics
+                all_results[method_name]['Q'].append(result.Q)
+                all_results[method_name]['Var_nu'].append(result.Var_nu)
+                all_results[method_name]['CV2'].append(result.CV2)
+                all_results[method_name]['time'].append(result.elapsed_s)
+
+                # Compute insertion/deletion if requested
+                if any(m in metrics for m in ['insertion', 'deletion', 'ins-del']):
+                    scores = compute_insertion_deletion(
+                        model, x, baseline, result.attributions, n_steps=100, batch_size=16)
+                    all_results[method_name]['insertion_auc'].append(scores.insertion_auc)
+                    all_results[method_name]['deletion_auc'].append(scores.deletion_auc)
+                    all_results[method_name]['ins_del'].append(
+                        scores.insertion_auc - scores.deletion_auc)
+
+                print(f"  {method_name:>12}: Q={result.Q:.4f}, time={result.elapsed_s:.2f}s")
+
+            except Exception as e:
+                print(f"  {method_name:>12}: FAILED - {e}")
+
+    # Compute statistics
+    print(f"\n{'='*70}")
+    print(f"RESULTS (mean ± std over {n_test} images)")
+    print(f"{'='*70}\n")
+
+    stats = {}
+    for method_name in methods:
+        method_stats = {}
+        for metric_name, values in all_results[method_name].items():
+            if len(values) > 0:
+                values_array = np.array(values)
+                method_stats[metric_name] = {
+                    'mean': float(np.mean(values_array)),
+                    'std': float(np.std(values_array)),
+                    'min': float(np.min(values_array)),
+                    'max': float(np.max(values_array)),
+                }
+        stats[method_name] = method_stats
+
+    # Print results table
+    print(f"{'Method':<16} {'Q ↑':>15} {'Var_ν ↓':>15} {'Ins AUC ↑':>15} "
+          f"{'Del AUC ↓':>15} {'Ins-Del ↑':>15} {'Time(s)':>12}")
+    print("─" * 110)
+
+    for method_name in methods:
+        if method_name in stats:
+            s = stats[method_name]
+            print(f"{method_name:<16} "
+                  f"{s['Q']['mean']:>6.4f}±{s['Q']['std']:<6.4f} "
+                  f"{s['Var_nu']['mean']:>6.4f}±{s['Var_nu']['std']:<6.4f} "
+                  f"{s['insertion_auc']['mean']:>6.4f}±{s['insertion_auc']['std']:<6.4f} "
+                  f"{s['deletion_auc']['mean']:>6.4f}±{s['deletion_auc']['std']:<6.4f} "
+                  f"{s['ins_del']['mean']:>6.4f}±{s['ins_del']['std']:<6.4f} "
+                  f"{s['time']['mean']:>7.2f}±{s['time']['std']:<4.2f}")
+
+    print(f"\n{'='*70}\n")
+
+    # Save to JSON if requested
+    if json_path:
+        output = {
+            'config': {
+                'model': model_name,
+                'n_test': n_test,
+                'N': N,
+                'min_conf': min_conf,
+                'methods': methods,
+                'metrics': metrics,
+                'seed': seed,
+            },
+            'statistics': stats,
+            'images': image_info_list,
+        }
+        with open(json_path, 'w') as f:
+            json_module.dump(output, f, indent=2)
+        print(f"✓ Results saved to {json_path}\n")
+
+    return stats
+
+
 def compare_methods(
     model_name: str = 'resnet50',
     image_path: Optional[str] = None,
@@ -196,6 +361,7 @@ def compare_methods(
     metrics: list[str] = None,
     N: int = 50,
     device: Optional[str] = None,
+    seed: int = 42,
 ):
     """
     Compare attribution methods on a given image.
@@ -208,7 +374,11 @@ def compare_methods(
         metrics: List of metrics to compute
         N: Number of interpolation steps
         device: Device to use (None for auto)
+        seed: Random seed for reproducibility (default: 42)
     """
+    # Set random seed for reproducibility
+    set_seed(seed)
+
     # Default methods and metrics
     if methods is None:
         methods = ['ig', 'idig', 'guided_ig', 'lig']
@@ -322,8 +492,36 @@ def main():
                         choices=['cpu', 'cuda', 'mps'],
                         help='Device to use (default: auto)')
 
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility (default: 42)')
+
+    parser.add_argument('--n-test', type=int, default=None,
+                        help='Number of test images for batch testing (default: None for single image)')
+
+    parser.add_argument('--min-conf', type=float, default=0.70,
+                        help='Minimum classification confidence for batch testing (default: 0.70)')
+
+    parser.add_argument('--json', type=str, default=None,
+                        help='Path to save JSON results (for batch testing)')
+
     args = parser.parse_args()
 
+    # Batch testing mode
+    if args.n_test is not None:
+        results = compare_methods_batch(
+            model_name=args.model,
+            methods=args.methods,
+            metrics=args.metrics,
+            N=args.steps,
+            n_test=args.n_test,
+            min_conf=args.min_conf,
+            device=args.device,
+            seed=args.seed,
+            json_path=args.json,
+        )
+        return
+
+    # Single image mode
     # Validate image path
     if args.image is not None and not os.path.exists(args.image):
         print(f"Error: Image file not found: {args.image}")
@@ -338,6 +536,7 @@ def main():
         metrics=args.metrics,
         N=args.steps,
         device=args.device,
+        seed=args.seed,
     )
 
 

@@ -18,7 +18,7 @@ from lig import compute_lig
 from lig_idig import compute_lig_idig
 
 # Import utilities
-from utility import ClassLogitModel, get_device, compute_insertion_deletion
+from utility import ClassLogitModel, get_device, compute_insertion_deletion, set_seed
 
 
 def example_basic():
@@ -26,6 +26,9 @@ def example_basic():
     print("="*70)
     print("EXAMPLE 1: Basic usage with random image")
     print("="*70 + "\n")
+
+    # Set seed for reproducibility
+    set_seed(42)
 
     # Setup device
     device = get_device()
@@ -91,6 +94,9 @@ def example_with_evaluation():
     print("EXAMPLE 2: With insertion/deletion evaluation")
     print("="*70 + "\n")
 
+    # Set seed for reproducibility
+    set_seed(42)
+
     # Setup device
     device = get_device()
 
@@ -155,6 +161,9 @@ def example_lig():
     print("="*70)
     print("EXAMPLE 3: LIG (Joint* method)")
     print("="*70 + "\n")
+
+    # Set seed for reproducibility
+    set_seed(42)
 
     # Setup device
     device = get_device()

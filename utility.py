@@ -16,6 +16,7 @@ Includes:
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -564,6 +565,149 @@ def get_device(force: Optional[str] = None) -> torch.device:
         dev = torch.device("cpu")
         print(f"[device] CPU")
     return dev
+
+
+def set_seed(seed: int = 42):
+    """
+    Set random seed for reproducibility across Python, NumPy, and PyTorch.
+
+    Args:
+        seed: Random seed value (default: 42)
+    """
+    import random
+    import numpy as np
+
+    # Python random
+    random.seed(seed)
+
+    # NumPy
+    np.random.seed(seed)
+
+    # PyTorch (CPU)
+    torch.manual_seed(seed)
+
+    # PyTorch (GPU)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # multi-GPU
+
+    # Ensure deterministic behavior (slower but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def load_image(backbone: nn.Module, device: torch.device, min_conf: float = 0.70, skip: int = 0):
+    """
+    Load an image for attribution testing.
+
+    Tries to load from local ImageNet samples, falls back to CIFAR-10, then synthetic.
+
+    Args:
+        backbone: Model to use for confidence checking
+        device: Device to use
+        min_conf: Minimum classification confidence threshold
+        skip: Number of valid images to skip (for batch testing)
+
+    Returns:
+        tuple: (x, target_class, confidence, source, class_name)
+            - x: Input tensor (1, 3, 224, 224)
+            - target_class: Predicted class index
+            - confidence: Prediction confidence
+            - source: Source path/description
+            - class_name: Human-readable class name (if available)
+    """
+    import torchvision.transforms as T
+
+    tf = T.Compose([
+        T.Resize(256), T.CenterCrop(224), T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+    x, pc, cf = None, None, None
+    source = "none"
+
+    # Try local images
+    for sample_dir in ["./sample_imagenet1k", "../sample_imagenet1k",
+                       os.path.expanduser("~/sample_imagenet1k")]:
+        if not os.path.isdir(sample_dir):
+            continue
+        try:
+            from PIL import Image
+            import random
+            jpegs = sorted([f for f in os.listdir(sample_dir)
+                            if f.lower().endswith(('.jpeg', '.jpg', '.png'))])
+            random.shuffle(jpegs)
+            if skip == 0:  # Only print on first call
+                print(f"Found {sample_dir} ({len(jpegs)} images)")
+            cskip = 0
+            for fname in jpegs:
+                try:
+                    img = Image.open(os.path.join(sample_dir, fname)).convert("RGB")
+                except Exception:
+                    continue
+                xc = tf(img).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    p = F.softmax(backbone(xc), dim=-1)
+                    c, pr = p[0].max(0)
+                if c.item() >= min_conf:
+                    cskip += 1
+                    if skip > 0 and cskip <= skip:
+                        continue
+                    x, pc, cf = xc, pr.item(), c.item()
+                    source = f"{sample_dir}/{fname}"
+                    print(f"  [{skip+1}] {fname} → class={pc}, conf={cf:.4f}")
+                    break
+        except Exception as e:
+            if skip == 0:
+                print(f"  Error: {e}")
+        if x is not None:
+            break
+
+    # Fallback: CIFAR-10
+    if x is None:
+        try:
+            from torchvision.datasets import CIFAR10
+            ctf = T.Compose([T.Resize(224), T.ToTensor(),
+                             T.Normalize([0.485, 0.456, 0.406],
+                                         [0.229, 0.224, 0.225])])
+            ds = CIFAR10("./data", train=False, download=True, transform=ctf)
+            for i in range(500):
+                im, _ = ds[i]
+                xc = im.unsqueeze(0).to(device)
+                with torch.no_grad():
+                    p = F.softmax(backbone(xc), dim=-1)
+                    c, pr = p[0].max(0)
+                if c.item() >= min_conf:
+                    x, pc, cf = xc, pr.item(), c.item()
+                    source = f"CIFAR-10 idx={i}"
+                    break
+        except Exception:
+            pass
+
+    # Fallback: synthetic
+    if x is None:
+        print("Using synthetic image fallback")
+        m = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        s = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        torch.manual_seed(42 + skip)
+        raw = (torch.randn(1, 3, 224, 224, device=device) * 0.2 + 0.5).clamp(0, 1)
+        x = (raw - m) / s
+        with torch.no_grad():
+            p = F.softmax(backbone(x), dim=-1)
+            c, pr = p[0].max(0)
+            pc, cf = pr.item(), c.item()
+        source = "synthetic"
+
+    # Extract human-readable class name from filename if possible
+    # ImageNet format: nXXXXXXXX_class_name.JPEG
+    class_name = None
+    if "/" in source:
+        fname = source.rsplit("/", 1)[-1]
+        name_part = fname.rsplit(".", 1)[0]        # strip extension
+        parts = name_part.split("_", 1)
+        if len(parts) == 2 and parts[0].startswith("n") and parts[0][1:].isdigit():
+            class_name = parts[1].replace("_", " ")
+
+    return x, pc, cf, source, class_name
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -126,18 +126,38 @@ print(f"LIG: Q={result_lig.Q:.4f}, Ins-Del={result_lig.insdel.insertion_auc - re
 
 ### Using Compare Framework
 
+**Single image mode:**
 ```bash
-# Compare methods with ResNet50
+# Compare methods with ResNet50 on a single image
 python compare_methods.py --model resnet50 --image path/to/image.jpg
 
 # Use specific methods
-python compare_methods.py --methods ig idig guided_ig lig --steps 50
+python compare_methods.py --methods ig idig guided_ig lig --steps 50 --image path/to/image.jpg
 
 # Try different models
 python compare_methods.py --model vgg16 --image path/to/image.jpg
 python compare_methods.py --model densenet121 --image path/to/image.jpg
 python compare_methods.py --model vit_b_16 --image path/to/image.jpg
 ```
+
+**Batch testing mode (recommended for benchmarking):**
+```bash
+# Test on 30 images and report mean±std (default)
+python compare_methods.py --n-test 30
+
+# Test with specific model and save results to JSON
+python compare_methods.py --model resnet50 --n-test 30 --json results.json
+
+# Test with different confidence threshold
+python compare_methods.py --n-test 50 --min-conf 0.80 --json results.json
+
+# Full benchmark with all options
+python compare_methods.py --model resnet50 --n-test 30 \
+    --methods ig idig guided_ig lig --steps 50 \
+    --min-conf 0.70 --json benchmark_results.json
+```
+
+The batch mode automatically loads images from `./sample_imagenet1k/` (or other standard locations) and reports aggregated statistics with mean±std for all metrics.
 
 
 ## The Signal-Harvesting Action
