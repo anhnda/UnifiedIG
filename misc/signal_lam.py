@@ -38,7 +38,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 # Import shared infrastructure from the existing codebase
 from utilss import (
     AttributionResult, StepInfo,
@@ -335,6 +335,7 @@ def _signal_harvesting_path_obj(
 #     with the signal-harvesting path objective.
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Default
 def optimize_path_signal_harvesting(
     model: nn.Module,
     x: torch.Tensor,
@@ -397,14 +398,230 @@ def optimize_path_signal_harvesting(
     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# §7  JOINT* OPTIMISATION  (Algorithm 1 — Full Signal-Harvesting Solution)
-#
-#     Alternating minimisation of (Eq. 20):
-#       Phase 1 (measure): fix γ, optimise μ via Eq. 24
-#       Phase 2 (path):    fix μ, optimise γ via velocity scheduling
-#       Each phase monotonically decreases the objective.
-# ═════════════════════════════════════════════════════════════════════════════
+# Low-Rank Basis
+# def optimize_path_signal_harvesting(
+#     model, x, baseline, mu, N=50, G=16, patch_size=14,
+#     n_iter=15, lr=0.002, lam=1.0,
+#     momentum=0.5, n_basis=15,
+#     early_stop_patience=10, early_stop_rtol=0.01, verbose=True,
+# ):
+#     device = x.device
+#     delta_x = x - baseline
+#     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+
+#     basis = torch.stack([
+#         torch.cos(torch.arange(N, device=device, dtype=torch.float32) * j * 3.14159 / N)
+#         for j in range(n_basis)
+#     ])
+#     basis = basis / basis.norm(dim=1, keepdim=True)
+
+#     A = torch.zeros(G, n_basis, device=device)
+#     A[:, 0] = basis[0].sum()
+
+#     best_obj = float("inf")
+#     best_A = A.clone()
+#     vel_A = torch.zeros_like(A)
+
+#     def _V_from_A(Am):
+#         return torch.clamp(Am @ basis, min=0.01)
+
+#     def _obj_of(Am):
+#         V = _V_from_A(Am)
+#         gp = _build_path_2d(baseline, delta_x, V, gmap, N)
+#         d_v, df_v = _eval_path_batched(model, gp, N, device)
+#         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
+
+#     eps = 0.01
+#     stale_count = 0
+#     prev_best = float("inf")
+#     obj_history = []
+#     restarted = False
+
+#     for it in range(n_iter):
+#         t_it = time.time()
+#         obj = _obj_of(A)
+#         improved = obj < best_obj
+#         if improved:
+#             best_obj = obj
+#             best_A = A.clone()
+
+#         grad_A = torch.zeros_like(A)
+#         grad_norms_per_group = []
+#         for g in range(G):
+#             j = torch.randint(0, n_basis, (1,)).item()
+#             A[g, j] += eps
+#             obj_plus = _obj_of(A)
+#             grad_A[g, j] = (obj_plus - obj) / eps
+#             A[g, j] -= eps
+#             grad_norms_per_group.append(float(grad_A[g].norm()))
+
+#         # Normalize gradient to have unit norm, then scale by lr
+#         grad_norm = grad_A.norm()
+#         if grad_norm > 1e-8:
+#             grad_A = grad_A / grad_norm
+
+#         vel_A = momentum * vel_A + grad_A
+#         A = A - lr * vel_A
+
+#         dt = time.time() - t_it
+#         obj_history.append(best_obj)
+
+#         if verbose:
+#             V_now = _V_from_A(A)
+#             print(f"  path_opt iter {it:2d}/{n_iter}  "
+#                   f"obj={obj:+.6f}  best={best_obj:+.6f}  "
+#                   f"|∇A|={float(grad_norm):.4f}  "
+#                   f"|vel|={float(vel_A.norm()):.4f}  "
+#                   f"V=[{float(V_now.min()):.2f},{float(V_now.max()):.2f}]  "
+#                   f"{'✓' if improved else ' '}  {dt:.2f}s")
+
+#         if abs(prev_best) > 1e-12:
+#             rel_change = abs(prev_best - best_obj) / abs(prev_best)
+#         else:
+#             rel_change = abs(prev_best - best_obj)
+
+#         if rel_change < early_stop_rtol:
+#             stale_count += 1
+#         else:
+#             stale_count = 0
+#         prev_best = best_obj
+
+#         if stale_count == early_stop_patience // 2 and not restarted:
+#             if verbose:
+#                 print(f"  🔄 Restart from best_A at iter {it}")
+#             A = best_A.clone()
+#             vel_A = torch.zeros_like(A)
+#             stale_count = 0
+#             restarted = True
+#             continue
+
+#         if stale_count >= early_stop_patience:
+#             if verbose:
+#                 print(f"  ⚡ Early stop at iter {it}: "
+#                       f"no improvement > {early_stop_rtol:.1%} "
+#                       f"for {early_stop_patience} iters")
+#             break
+
+#     if verbose:
+#         n_params = G * n_basis
+#         print(f"  path_opt done: {len(obj_history)} iters, "
+#               f"{n_params} params (G={G} × basis={n_basis}), "
+#               f"obj {obj_history[0]:+.4f} → {best_obj:+.4f}  "
+#               f"(Δ={obj_history[0] - best_obj:+.4f})")
+
+#     V = _V_from_A(best_A)
+#     return _build_path_2d(baseline, delta_x, V, gmap, N)
+
+# Gauss bump
+# def optimize_path_signal_harvesting(
+#     model, x, baseline, mu, N=50, G=16, patch_size=14,
+#     n_iter=15, lr=0.08, lam=1.0,
+#     momentum=0.7, bump_width=None,
+#     early_stop_patience=10, early_stop_rtol=0.01, verbose=True,
+# ):
+#     device = x.device
+#     delta_x = x - baseline
+#     gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+
+#     V = torch.ones(G, N, device=device)
+#     best_obj = float("inf")
+#     best_V = V.clone()
+#     vel_V = torch.zeros_like(V)
+
+#     if bump_width is None:
+#         bump_width = max(N // 10, 3)
+
+#     # Precompute timestep indices
+#     t_idx = torch.arange(N, device=device, dtype=torch.float32)
+
+#     def _obj_of(Vm):
+#         gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
+#         d_v, df_v = _eval_path_batched(model, gp, N, device)
+#         return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
+
+#     eps = 0.05
+#     stale_count = 0
+#     prev_best = float("inf")
+#     obj_history = []
+#     restarted = False
+
+#     for it in range(n_iter):
+#         t_it = time.time()
+#         obj = _obj_of(V)
+#         improved = obj < best_obj
+#         if improved:
+#             best_obj = obj
+#             best_V = V.clone()
+
+#         grad_V = torch.zeros_like(V)
+#         grad_norms_per_group = []
+#         for g in range(G):
+#             # Random Gaussian bump
+#             center = torch.randint(0, N, (1,)).item()
+#             bump = torch.exp(-0.5 * ((t_idx - center) / bump_width) ** 2)
+#             bump = bump / bump.norm()
+
+#             V[g] += eps * bump
+#             obj_plus = _obj_of(V)
+#             V[g] -= eps * bump
+
+#             grad_V[g] = ((obj_plus - obj) / eps) * bump
+#             grad_norms_per_group.append(float(grad_V[g].norm()))
+
+#         # SGD with momentum
+#         vel_V = momentum * vel_V + grad_V
+#         V = V - lr * vel_V
+#         V = torch.clamp(V, min=0.01)
+
+#         dt = time.time() - t_it
+#         obj_history.append(best_obj)
+
+#         if verbose:
+#             mean_g = sum(grad_norms_per_group) / len(grad_norms_per_group)
+#             max_g = max(grad_norms_per_group)
+#             print(f"  path_opt iter {it:2d}/{n_iter}  "
+#                   f"obj={obj:+.6f}  best={best_obj:+.6f}  "
+#                   f"|∇V|={float(grad_V.norm()):.4f}  "
+#                   f"|vel|={float(vel_V.norm()):.4f}  "
+#                   f"V=[{float(V.min()):.2f},{float(V.max()):.2f}]  "
+#                   f"{'✓' if improved else ' '}  {dt:.2f}s")
+
+#         # Early stopping
+#         if abs(prev_best) > 1e-12:
+#             rel_change = abs(prev_best - best_obj) / abs(prev_best)
+#         else:
+#             rel_change = abs(prev_best - best_obj)
+
+#         if rel_change < early_stop_rtol:
+#             stale_count += 1
+#         else:
+#             stale_count = 0
+#         prev_best = best_obj
+
+#         # Restart from best halfway through patience
+#         if stale_count == early_stop_patience // 2 and not restarted:
+#             if verbose:
+#                 print(f"  🔄 Restart from best_V at iter {it}")
+#             V = best_V.clone()
+#             vel_V = torch.zeros_like(V)
+#             stale_count = 0
+#             restarted = True
+#             continue
+
+#         if stale_count >= early_stop_patience:
+#             if verbose:
+#                 print(f"  ⚡ Early stop at iter {it}: "
+#                       f"no improvement > {early_stop_rtol:.1%} "
+#                       f"for {early_stop_patience} iters")
+#             break
+
+#     if verbose:
+#         print(f"  path_opt done: {len(obj_history)} iters, "
+#               f"bump_width={bump_width}, "
+#               f"obj {obj_history[0]:+.4f} → {best_obj:+.4f}  "
+#               f"(Δ={obj_history[0] - best_obj:+.4f})")
+
+#     return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
 def joint_star_ig(
     model: nn.Module,
@@ -602,7 +819,7 @@ def run_all_methods(
     patch_size: int = 14,
     n_alternating: int = 2,
     mu_iter: int = 300,
-    path_iter: int = 10,
+    path_iter: int = 15,
     guided_init: bool = False,
 ) -> list[AttributionResult]:
     """
@@ -628,12 +845,12 @@ def run_all_methods(
     results.append(mu_optimized_ig(
         model, x, baseline, N, lam=lam, tau=tau, n_iter=mu_iter))
 
-    # 5. Joint (λ=0)  — original LAM, no signal harvesting
-    init_path = gig.gamma_pts if guided_init else None
-    results.append(joint_ig(
-        model, x, baseline, N, G=G, n_alternating=n_alternating,
-        tau=0.005, mu_iter=mu_iter, path_iter=path_iter,
-        init_path=init_path))
+    # # 5. Joint (λ=0)  — original LAM, no signal harvesting
+    # init_path = gig.gamma_pts if guided_init else None
+    # results.append(joint_ig(
+    #     model, x, baseline, N, G=G, n_alternating=n_alternating,
+    #     tau=0.005, mu_iter=mu_iter, path_iter=path_iter,
+    #     init_path=init_path))
 
     # 6. Joint*  (λ>0) — full signal-harvesting solution
     init_path_star = gig.gamma_pts if guided_init else None
@@ -647,30 +864,20 @@ def run_all_methods(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §9  MAIN — demo / comparison
+# §9  EXPERIMENT RUNNER
 # ═════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Signal-Harvesting IG — unified variational framework")
-    parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--lam", type=float, default=1.0,
-                        help="Signal-harvesting strength λ (0 = original LAM)")
-    parser.add_argument("--tau", type=float, default=0.01,
-                        help="L2 admissibility multiplier τ")
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--min-conf", type=float, default=0.70)
-    parser.add_argument("--guided-init", action="store_true")
-    parser.add_argument("--json", type=str, default=None)
-    args = parser.parse_args()
-
-    from lam import load_image_and_model, _forward_scalar
+def run_experiment(N=50, device=None, min_conf=0.70, guided_init=False,
+                   lam=1.0, tau=0.01, skip=0):
+    """Full experiment: load model/image, run all 6 methods, print table."""
+    from lam import load_image_and_model
     from utilss import get_device
 
-    device = get_device(force=args.device)
-    model, x, baseline, info = load_image_and_model(device, args.min_conf)
+    if device is None:
+        device = get_device()
+
+    print("Loading ResNet-50 and image...")
+    model, x, baseline, info = load_image_and_model(device, min_conf, skip=skip)
 
     f_x = _forward_scalar(model, x)
     f_bl = _forward_scalar(model, baseline)
@@ -680,15 +887,16 @@ if __name__ == "__main__":
     print(f"Source: {info['source']}")
     print(f"Class : {info['target_class']} (conf={info['confidence']:.4f})")
     print(f"f(x) = {f_x:.4f},  f(bl) = {f_bl:.4f},  Δf = {delta_f:.4f}")
-    print(f"N = {args.steps},  λ = {args.lam},  τ = {args.tau}\n")
+    print(f"N = {N},  λ = {lam},  τ = {tau}\n")
 
     methods = run_all_methods(
-        model, x, baseline, N=args.steps,
-        lam=args.lam, tau=args.tau,
-        guided_init=args.guided_init)
+        model, x, baseline, N=N,
+        lam=lam, tau=tau,
+        guided_init=guided_init)
 
-    # ── Report ──
-    hdr = f"{'Method':<16} {'Var_ν':>10} {'CV²':>8} {'𝒬':>8} {'Obj':>10} {'Time':>8}"
+    # ── Print table ──
+    hdr = (f"{'Method':<16} {'Var_ν':>10} {'CV²':>8} {'𝒬':>8} "
+           f"{'Obj':>10} {'Time':>8}")
     print(hdr)
     print("─" * len(hdr))
 
@@ -697,17 +905,116 @@ if __name__ == "__main__":
         df_arr = torch.tensor([s.delta_f_k for s in m.steps], device=device)
         mu_arr = torch.tensor([s.mu_k for s in m.steps], device=device)
         obj, _, _, _ = compute_signal_harvesting_objective(
-            d_arr, df_arr, mu_arr, lam=args.lam, tau=args.tau)
+            d_arr, df_arr, mu_arr, lam=lam, tau=tau)
         print(f"{m.name:<16} {m.Var_nu:>10.6f} {m.CV2:>8.4f} "
               f"{m.Q:>8.4f} {obj:>10.4f} {m.elapsed_s:>7.1f}s")
 
+    results = {
+        "config": {"N": N, "lam": lam, "tau": tau},
+        "image_info": info,
+        "model_info": {"f_x": f_x, "f_baseline": f_bl,
+                       "delta_f": delta_f, "N": N, "device": str(device)},
+        "methods": {m.name: m.to_dict() for m in methods},
+    }
+    return results, methods, model, x, baseline, info
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §10  MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import argparse
+    import json
+    from utilss import set_seed
+    parser = argparse.ArgumentParser(
+        description="Signal-Harvesting IG — unified variational framework")
+    parser.add_argument("--json", type=str, default=None,
+                        help="Export results to JSON file")
+    parser.add_argument("--steps", type=int, default=50,
+                        help="Number of interpolation steps N")
+    parser.add_argument("--lam", type=float, default=1.0,
+                        help="Signal-harvesting strength λ (0 = original LAM)")
+    parser.add_argument("--tau", type=float, default=0.01,
+                        help="L2 admissibility multiplier τ")
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--min-conf", type=float, default=0.70)
+    parser.add_argument("--guided-init", action="store_true",
+                        help="Initialise Joint/Joint* from Guided IG path")
+    # ── Visualisation flags ──
+    parser.add_argument("--viz", action="store_true",
+                        help="Generate attribution heatmap plot")
+    parser.add_argument("--viz-path", type=str,
+                        default="attribution_heatmaps.png",
+                        help="Output path for heatmap plot")
+    parser.add_argument("--viz-fidelity", action="store_true",
+                        help="Generate step-fidelity φ_k plot")
+    # ── Insertion / Deletion ──
+    parser.add_argument("--insdel", action="store_true",
+                        help="Compute pixel-based insertion/deletion AUC")
+    parser.add_argument("--insdel-steps", type=int, default=100,
+                        help="Number of steps for ins/del evaluation")
+    parser.add_argument("--viz-insdel", action="store_true",
+                        help="Generate insertion/deletion curve plot")
+    # ── Region-based Insertion / Deletion ──
+    parser.add_argument("--region-insdel", action="store_true",
+                        help="Compute region-based ins/del (SIC-style)")
+    parser.add_argument("--viz-region-insdel", action="store_true",
+                        help="Generate region-based ins/del curve plot")
+    parser.add_argument("--patch-size", type=int, default=14,
+                        help="Grid patch size for region ins/del")
+    parser.add_argument("--no-slic", action="store_true",
+                        help="Use grid patches instead of SLIC superpixels")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
+    parser.add_argument("--skip", type=int, default=0)
+              
+    
+    args = parser.parse_args()
+    set_seed(args.seed)
+
+    from utilss import (
+        get_device, run_insertion_deletion, run_region_insertion_deletion,
+        visualize_step_fidelity, visualize_insertion_deletion,
+    )
+    from lam import visualize_attributions
+
+    device = get_device(force=args.device)
+    results, methods, model, x, baseline, info = run_experiment(
+        N=args.steps, device=device, min_conf=args.min_conf,
+        guided_init=args.guided_init, lam=args.lam, tau=args.tau, skip=args.skip)
+
+    # ── Insertion / Deletion ──
+    if args.insdel or args.viz_insdel:
+        run_insertion_deletion(model, x, baseline, methods,
+                               n_steps=args.insdel_steps)
+
+    if args.region_insdel or args.viz_region_insdel:
+        run_region_insertion_deletion(
+            model, x, baseline, methods,
+            patch_size=args.patch_size,
+            use_slic=not args.no_slic)
+
+    # ── JSON export ──
     if args.json:
-        import json
-        results = {
-            "config": {"N": args.steps, "lam": args.lam, "tau": args.tau},
-            "image_info": info,
-            "methods": {m.name: m.to_dict() for m in methods},
-        }
         with open(args.json, "w") as f:
             json.dump(results, f, indent=2)
         print(f"\nResults → {args.json}")
+
+    # ── Visualisation ──
+    if args.viz:
+        visualize_attributions(x, methods, info, save_path=args.viz_path,
+                               delta_f=results["model_info"]["delta_f"])
+
+    if args.viz_fidelity:
+        fpath = args.viz_path.replace(".png", "_fidelity.png")
+        visualize_step_fidelity(methods, save_path=fpath)
+
+    if args.viz_insdel:
+        ipath = args.viz_path.replace(".png", "_insdel.png")
+        visualize_insertion_deletion(methods, save_path=ipath)
+
+    if args.viz_region_insdel:
+        rpath = args.viz_path.replace(".png", "_region_insdel.png")
+        visualize_insertion_deletion(methods, save_path=rpath,
+                                     use_region=True)

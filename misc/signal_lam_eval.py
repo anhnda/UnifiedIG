@@ -1,391 +1,804 @@
 """
-signal_lam_eval.py — Multi-Image Evaluation for Signal-Harvesting IG
-======================================================================
+signal_lam_eval.py — Evaluation Script for Signal-Harvesting Action Methods
+=============================================================================
 
-Evaluates all IG methods on multiple images and reports statistics.
+Evaluates attribution methods across multiple images and computes statistics.
 
-Usage:
-    python signal_lam_eval.py --n 100 --image-folder ./sample_imagenet1k
-    python signal_lam_eval.py --n 50 --steps 50 --lam 1.0
+Features:
+- Path optimization options: Default, Gauss, or Low-rank
+- Multi-image evaluation with configurable n_test
+- Insertion/deletion metrics (pixel and region-based)
+- Statistical reporting (mean ± std)
+- JSON export of results
 """
 
 from __future__ import annotations
 
-import os
-import time
-import argparse
 import json
-from pathlib import Path
+import time
 from typing import Optional
+from dataclasses import asdict
 
 import torch
 import torch.nn as nn
-import torchvision.models as models
-import torchvision.transforms as T
 import numpy as np
-from PIL import Image
 
-# Import from signal_lam.py
-from signal_lam import (
-    run_all_methods,
-    compute_signal_harvesting_objective,
-    _forward_scalar,
+from utilss import (
+    AttributionResult,
+    compute_all_metrics,
+    compute_insertion_deletion,
+    compute_region_insertion_deletion,
+    get_device,
+    set_seed,
 )
-from lam import ClassLogitModel
-from utilss import get_device, set_seed, compute_insertion_deletion
+
+from lam import (
+    _forward_scalar,
+    _forward_and_gradient_batch,
+    _gradient_batch,
+    _rescale,
+    _build_steps,
+    _straight_line_pass,
+    _build_spatial_groups,
+    _build_path_2d,
+    _eval_path_batched,
+    standard_ig,
+    idgi,
+    guided_ig,
+    load_image_and_model,
+)
+
+from signal_lam import (
+    optimize_mu_signal_harvesting,
+    compute_signal_harvesting_objective,
+    _signal_harvesting_path_obj,
+    _pack_result,
+)
 
 
-def load_images_from_folder(
-    folder_path: str,
-    n_images: int,
-    min_conf: float,
-    device: torch.device,
-    backbone: nn.Module,
-) -> list[tuple[torch.Tensor, torch.Tensor, dict]]:
-    """
-    Load n images from folder that meet confidence threshold.
+# ═════════════════════════════════════════════════════════════════════════════
+# §1  PATH OPTIMIZATION VARIANTS
+# ═════════════════════════════════════════════════════════════════════════════
 
-    Returns:
-        List of (x, baseline, info) tuples
-    """
-    # Image preprocessing transform
-    tf = T.Compose([
-        T.Resize(256),
-        T.CenterCrop(224),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+def optimize_path_default(
+    model, x, baseline, mu, N=50, G=16, patch_size=14,
+    n_iter=15, lr=0.08, lam=1.0,
+):
+    """Default path optimization: stochastic FD on velocity schedule."""
+    device = x.device
+    delta_x = x - baseline
+    gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+
+    V = torch.ones(G, N, device=device)
+    best_obj = float("inf")
+    best_V = V.clone()
+
+    def _obj_of(Vm):
+        gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
+        d_v, df_v = _eval_path_batched(model, gp, N, device)
+        return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
+
+    eps = 0.05
+    for it in range(n_iter):
+        obj = _obj_of(V)
+        if obj < best_obj:
+            best_obj = obj
+            best_V = V.clone()
+
+        grad_V = torch.zeros_like(V)
+        for g in range(G):
+            k = torch.randint(0, N, (1,)).item()
+            V[g, k] += eps
+            obj_plus = _obj_of(V)
+            grad_V[g, k] = (obj_plus - obj) / eps
+            V[g, k] -= eps
+
+        V = V - lr * grad_V
+        V = torch.clamp(V, min=0.01)
+
+    return _build_path_2d(baseline, delta_x, best_V, gmap, N)
+
+
+def optimize_path_lowrank(
+    model, x, baseline, mu, N=50, G=16, patch_size=14,
+    n_iter=15, lr=0.002, lam=1.0,
+    momentum=0.5, n_basis=15,
+    early_stop_patience=10, early_stop_rtol=0.01,
+):
+    """Low-rank basis path optimization."""
+    device = x.device
+    delta_x = x - baseline
+    gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
+
+    basis = torch.stack([
+        torch.cos(torch.arange(N, device=device, dtype=torch.float32) * j * 3.14159 / N)
+        for j in range(n_basis)
     ])
+    basis = basis / basis.norm(dim=1, keepdim=True)
 
-    # Find all images in folder
-    folder = Path(folder_path)
-    if not folder.exists():
-        raise ValueError(f"Folder not found: {folder_path}")
+    A = torch.zeros(G, n_basis, device=device)
+    A[:, 0] = basis[0].sum()
 
-    image_files = sorted([
-        f for f in folder.iterdir()
-        if f.suffix.lower() in ['.jpg', '.jpeg', '.png']
-    ])
+    best_obj = float("inf")
+    best_A = A.clone()
+    vel_A = torch.zeros_like(A)
 
-    if len(image_files) == 0:
-        raise ValueError(f"No images found in {folder_path}")
+    def _V_from_A(Am):
+        return torch.clamp(Am @ basis, min=0.01)
 
-    print(f"Found {len(image_files)} images in {folder_path}")
+    def _obj_of(Am):
+        V = _V_from_A(Am)
+        gp = _build_path_2d(baseline, delta_x, V, gmap, N)
+        d_v, df_v = _eval_path_batched(model, gp, N, device)
+        return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
 
-    # Load ImageNet class names
-    try:
-        import urllib.request
-        url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
-        with urllib.request.urlopen(url, timeout=5) as f:
-            class_names = [line.decode().strip() for line in f]
-    except Exception:
-        class_names = [f"class_{i}" for i in range(1000)]
+    eps = 0.01
+    stale_count = 0
+    prev_best = float("inf")
+    restarted = False
 
-    # Baseline (black image in normalized space)
-    baseline_raw = torch.zeros(1, 3, 224, 224, device=device)
+    for it in range(n_iter):
+        obj = _obj_of(A)
+        improved = obj < best_obj
+        if improved:
+            best_obj = obj
+            best_A = A.clone()
 
-    loaded_images = []
-    skipped = 0
+        grad_A = torch.zeros_like(A)
+        for g in range(G):
+            j = torch.randint(0, n_basis, (1,)).item()
+            A[g, j] += eps
+            obj_plus = _obj_of(A)
+            grad_A[g, j] = (obj_plus - obj) / eps
+            A[g, j] -= eps
 
-    for img_file in image_files:
-        if len(loaded_images) >= n_images:
+        grad_norm = grad_A.norm()
+        if grad_norm > 1e-8:
+            grad_A = grad_A / grad_norm
+
+        vel_A = momentum * vel_A + grad_A
+        A = A - lr * vel_A
+
+        if abs(prev_best) > 1e-12:
+            rel_change = abs(prev_best - best_obj) / abs(prev_best)
+        else:
+            rel_change = abs(prev_best - best_obj)
+
+        if rel_change < early_stop_rtol:
+            stale_count += 1
+        else:
+            stale_count = 0
+        prev_best = best_obj
+
+        if stale_count == early_stop_patience // 2 and not restarted:
+            A = best_A.clone()
+            vel_A = torch.zeros_like(A)
+            stale_count = 0
+            restarted = True
+            continue
+
+        if stale_count >= early_stop_patience:
             break
 
-        try:
-            # Load and preprocess image
-            img = Image.open(img_file).convert("RGB")
-            x = tf(img).unsqueeze(0).to(device)
+    V = _V_from_A(best_A)
+    return _build_path_2d(baseline, delta_x, V, gmap, N)
 
-            # Get prediction
-            with torch.no_grad():
-                logits = backbone(x)
-                probs = torch.softmax(logits, dim=1)
-                conf, pred_class = probs.max(dim=1)
 
-            conf = conf.item()
-            pred_class = pred_class.item()
+def optimize_path_gauss(
+    model, x, baseline, mu, N=50, G=16, patch_size=14,
+    n_iter=15, lr=0.08, lam=1.0,
+    momentum=0.7, bump_width=None,
+    early_stop_patience=10, early_stop_rtol=0.01,
+):
+    """Gaussian bump path optimization."""
+    device = x.device
+    delta_x = x - baseline
+    gmap = _build_spatial_groups(model, x, baseline, G, patch_size)
 
-            # Check confidence threshold
-            if conf < min_conf:
-                skipped += 1
-                continue
+    V = torch.ones(G, N, device=device)
+    best_obj = float("inf")
+    best_V = V.clone()
+    vel_V = torch.zeros_like(V)
 
-            # Wrap model for this predicted class
-            model = ClassLogitModel(backbone, pred_class)
+    if bump_width is None:
+        bump_width = max(N // 10, 3)
 
-            # Create info dict
-            info = {
-                "model": "ResNet-50",
-                "source": str(img_file.name),
-                "target_class": class_names[pred_class] if pred_class < len(class_names) else f"class_{pred_class}",
-                "confidence": conf,
-                "pred_class_idx": pred_class,
-            }
+    t_idx = torch.arange(N, device=device, dtype=torch.float32)
 
-            loaded_images.append((x, baseline_raw, info, model))
-            print(f"  [{len(loaded_images)}/{n_images}] {img_file.name}: {info['target_class']} (conf={conf:.4f})")
+    def _obj_of(Vm):
+        gp = _build_path_2d(baseline, delta_x, Vm, gmap, N)
+        d_v, df_v = _eval_path_batched(model, gp, N, device)
+        return _signal_harvesting_path_obj(d_v, df_v, mu, lam=lam)
 
-        except Exception as e:
-            print(f"  Skipped {img_file.name}: {e}")
-            skipped += 1
+    eps = 0.05
+    stale_count = 0
+    prev_best = float("inf")
+    restarted = False
+
+    for it in range(n_iter):
+        obj = _obj_of(V)
+        improved = obj < best_obj
+        if improved:
+            best_obj = obj
+            best_V = V.clone()
+
+        grad_V = torch.zeros_like(V)
+        for g in range(G):
+            center = torch.randint(0, N, (1,)).item()
+            bump = torch.exp(-0.5 * ((t_idx - center) / bump_width) ** 2)
+            bump = bump / bump.norm()
+
+            V[g] += eps * bump
+            obj_plus = _obj_of(V)
+            V[g] -= eps * bump
+
+            grad_V[g] = ((obj_plus - obj) / eps) * bump
+
+        vel_V = momentum * vel_V + grad_V
+        V = V - lr * vel_V
+        V = torch.clamp(V, min=0.01)
+
+        if abs(prev_best) > 1e-12:
+            rel_change = abs(prev_best - best_obj) / abs(prev_best)
+        else:
+            rel_change = abs(prev_best - best_obj)
+
+        if rel_change < early_stop_rtol:
+            stale_count += 1
+        else:
+            stale_count = 0
+        prev_best = best_obj
+
+        if stale_count == early_stop_patience // 2 and not restarted:
+            V = best_V.clone()
+            vel_V = torch.zeros_like(V)
+            stale_count = 0
+            restarted = True
             continue
 
-    if len(loaded_images) == 0:
-        raise ValueError(f"No images with confidence >= {min_conf} found")
+        if stale_count >= early_stop_patience:
+            break
 
-    print(f"\nLoaded {len(loaded_images)} images (skipped {skipped})")
-    return loaded_images
+    return _build_path_2d(baseline, delta_x, best_V, gmap, N)
 
 
-def run_evaluation_on_images(
-    images: list,
-    N: int,
-    lam: float,
-    tau: float,
-    guided_init: bool,
-    device: torch.device,
-) -> dict:
+# ═════════════════════════════════════════════════════════════════════════════
+# §2  JOINT* WITH SELECTABLE PATH OPTIMIZATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def joint_star_ig_eval(
+    model: nn.Module,
+    x: torch.Tensor,
+    baseline: torch.Tensor,
+    N: int = 50,
+    G: int = 16,
+    patch_size: int = 14,
+    n_alternating: int = 2,
+    lam: float = 1.0,
+    tau: float = 0.01,
+    mu_iter: int = 300,
+    path_iter: int = 10,
+    init_path: Optional[list[torch.Tensor]] = None,
+    path_opt: str = "default",
+) -> AttributionResult:
     """
-    Run all methods on multiple images and compute statistics.
+    Joint* with selectable path optimization method.
 
-    Returns:
-        dict with mean/std for each metric per method
+    path_opt: "default", "lowrank", or "gauss"
     """
-    n_images = len(images)
+    t0 = time.time()
+    device = x.device
+    delta_x = x - baseline
+    f_bl = _forward_scalar(model, baseline)
+    f_x = _forward_scalar(model, x)
+    target = f_x - f_bl
 
-    # Initialize accumulators for each method
-    # Methods: IG, IDGI, Guided IG, μ-Optimized*, Joint(λ=0), Joint*
-    method_names = ["IG", "IDGI", "Guided IG", "μ-Optimized*", "Joint(λ=0)", "Joint*"]
-    stats = {name: {
-        "Q": [],
-        "Var_nu": [],
-        "CV2": [],
-        "Obj": [],
-        "Time": [],
-        "Ins_AUC": [],
-        "Del_AUC": [],
-        "Ins-Del": [],
-    } for name in method_names}
+    if init_path is not None:
+        assert len(init_path) == N + 1
+        gamma_pts = [p.clone() for p in init_path]
+    else:
+        gamma_pts = [baseline + (k / N) * delta_x for k in range(N + 1)]
 
-    # Run on each image
-    for idx, (x, baseline, info, model) in enumerate(images):
-        print(f"\n{'='*70}")
-        print(f"Image {idx+1}/{n_images}: {info['source']}")
-        print(f"Class: {info['target_class']} (conf={info['confidence']:.4f})")
-        print(f"{'='*70}")
+    mu = torch.full((N,), 1.0 / N, device=device)
+    Q_history = []
 
-        # Compute delta_f
-        f_x = _forward_scalar(model, x)
-        f_bl = _forward_scalar(model, baseline)
-        delta_f = f_x - f_bl
+    best_obj = float("inf")
+    best_Q = -1.0
+    best_gamma_pts = gamma_pts
+    best_mu = mu
+    best_d_list: list[float] = []
+    best_df_list: list[float] = []
+    best_f_vals: list[float] = []
+    best_gnorms: list[float] = []
+    best_grads: list[torch.Tensor] = []
 
-        print(f"f(x) = {f_x:.4f}, f(bl) = {f_bl:.4f}, Δf = {delta_f:.4f}")
+    # Select path optimization function
+    if path_opt == "lowrank":
+        path_optimizer = optimize_path_lowrank
+    elif path_opt == "gauss":
+        path_optimizer = optimize_path_gauss
+    else:
+        path_optimizer = optimize_path_default
 
-        # Run all methods
-        try:
-            methods = run_all_methods(
-                model, x, baseline, N=N,
-                lam=lam, tau=tau,
-                guided_init=guided_init
-            )
+    def _evaluate_path(gp, mu_vec):
+        ap = torch.cat(gp, dim=0)
+        with torch.no_grad():
+            fa = model(ap)
+        pn = ap[:N]
+        gb = _gradient_batch(model, pn)
+        sb = ap[1:] - ap[:N]
+        dt = (gb * sb).view(N, -1).sum(dim=1)
+        dl = dt.tolist()
 
-            # Extract metrics for each method
-            for m in methods:
-                d_arr = torch.tensor([s.d_k for s in m.steps], device=device)
-                df_arr = torch.tensor([s.delta_f_k for s in m.steps], device=device)
-                mu_arr = torch.tensor([s.mu_k for s in m.steps], device=device)
-                obj, _, _, _ = compute_signal_harvesting_objective(
-                    d_arr, df_arr, mu_arr, lam=lam, tau=tau
-                )
+        f0 = fa[0].item()
+        fv = [f0] + fa.tolist()
+        dfl = [fv[k + 1] - fv[k] for k in range(N)]
 
-                # Store metrics
-                stats[m.name]["Q"].append(m.Q)
-                stats[m.name]["Var_nu"].append(m.Var_nu)
-                stats[m.name]["CV2"].append(m.CV2)
-                stats[m.name]["Obj"].append(obj)
-                stats[m.name]["Time"].append(m.elapsed_s)
+        gn = gb.view(N, -1).norm(dim=1).tolist()
+        gr = [gb[k:k+1].clone() for k in range(N)]
+        da = torch.tensor(dl, device=device)
+        dfa = torch.tensor(dfl, device=device)
+        return dl, dfl, fv, gn, gr, da, dfa
 
-                # Compute insertion/deletion scores
-                ins_del_scores = compute_insertion_deletion(
-                    model, x, baseline, m.attributions, n_steps=100
-                )
-                stats[m.name]["Ins_AUC"].append(ins_del_scores.insertion_auc)
-                stats[m.name]["Del_AUC"].append(ins_del_scores.deletion_auc)
-                stats[m.name]["Ins-Del"].append(ins_del_scores.insertion_auc - ins_del_scores.deletion_auc)
+    for s in range(n_alternating):
+        d_list, df_list, f_vals, gnorms, grads, d_arr, df_arr = \
+            _evaluate_path(gamma_pts, mu)
 
-                print(f"{m.name:<16} Q={m.Q:.6f} Var_ν={m.Var_nu:.6e} Ins-Del={ins_del_scores.insertion_auc - ins_del_scores.deletion_auc:.4f} Time={m.elapsed_s:.1f}s")
+        mu = optimize_mu_signal_harvesting(
+            d_arr, df_arr, lam=lam, tau=tau, n_iter=mu_iter)
 
-        except Exception as e:
-            print(f"ERROR on image {idx+1}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+        var_mu, cv2_mu, Q_mu = compute_all_metrics(d_arr, df_arr, mu)
+        obj_mu, _, _, _ = compute_signal_harvesting_objective(
+            d_arr, df_arr, mu, lam=lam, tau=tau)
 
-    # Compute statistics
-    results = {}
-    for name in method_names:
-        if len(stats[name]["Q"]) == 0:
-            continue
+        if obj_mu < best_obj or (abs(obj_mu - best_obj) < 1e-8 and Q_mu > best_Q):
+            best_obj = obj_mu
+            best_Q = Q_mu
+            best_gamma_pts = gamma_pts
+            best_mu = mu.clone()
+            best_d_list, best_df_list = d_list, df_list
+            best_f_vals, best_gnorms, best_grads = f_vals, gnorms, grads
 
-        results[name] = {
-            "Q_mean": float(np.mean(stats[name]["Q"])),
-            "Q_std": float(np.std(stats[name]["Q"])),
-            "Var_nu_mean": float(np.mean(stats[name]["Var_nu"])),
-            "Var_nu_std": float(np.std(stats[name]["Var_nu"])),
-            "CV2_mean": float(np.mean(stats[name]["CV2"])),
-            "CV2_std": float(np.std(stats[name]["CV2"])),
-            "Obj_mean": float(np.mean(stats[name]["Obj"])),
-            "Obj_std": float(np.std(stats[name]["Obj"])),
-            "Time_mean": float(np.mean(stats[name]["Time"])),
-            "Time_std": float(np.std(stats[name]["Time"])),
-            "Ins_AUC_mean": float(np.mean(stats[name]["Ins_AUC"])),
-            "Ins_AUC_std": float(np.std(stats[name]["Ins_AUC"])),
-            "Del_AUC_mean": float(np.mean(stats[name]["Del_AUC"])),
-            "Del_AUC_std": float(np.std(stats[name]["Del_AUC"])),
-            "Ins-Del_mean": float(np.mean(stats[name]["Ins-Del"])),
-            "Ins-Del_std": float(np.std(stats[name]["Ins-Del"])),
-            "n_images": len(stats[name]["Q"]),
-        }
+        Q_path = Q_mu
+        obj_path = obj_mu
+        if s < n_alternating - 1:
+            new_gamma_pts = path_optimizer(
+                model, x, baseline, mu, N=N, G=G,
+                patch_size=patch_size, n_iter=path_iter, lam=lam)
+
+            new_d_list, new_df_list, new_f_vals, new_gnorms, new_grads, \
+                new_d_arr, new_df_arr = _evaluate_path(new_gamma_pts, mu)
+            _, _, Q_new = compute_all_metrics(new_d_arr, new_df_arr, mu)
+            obj_new, _, _, _ = compute_signal_harvesting_objective(
+                new_d_arr, new_df_arr, mu, lam=lam, tau=tau)
+
+            Q_path = Q_new
+            obj_path = obj_new
+
+            if obj_new < best_obj:
+                gamma_pts = new_gamma_pts
+                d_list, df_list = new_d_list, new_df_list
+                f_vals, gnorms, grads = new_f_vals, new_gnorms, new_grads
+                d_arr, df_arr = new_d_arr, new_df_arr
+
+                best_obj = obj_new
+                best_Q = Q_new
+                best_gamma_pts = new_gamma_pts
+                best_mu = mu.clone()
+                best_d_list, best_df_list = new_d_list, new_df_list
+                best_f_vals, best_gnorms, best_grads = new_f_vals, new_gnorms, new_grads
+            else:
+                gamma_pts = best_gamma_pts
+                mu = best_mu.clone()
+
+        Q_history.append({
+            "iteration": s,
+            "Q_after_mu": float(Q_mu),
+            "Q_after_path": float(Q_path),
+            "obj_after_mu": float(obj_mu),
+            "obj_after_path": float(obj_path),
+            "best_Q": float(best_Q),
+            "best_obj": float(best_obj),
+        })
+
+    gamma_pts = best_gamma_pts
+    mu = best_mu
+    grads = best_grads
+
+    attr = torch.zeros_like(x)
+    for k in range(N):
+        attr += mu[k] * grads[k] * (gamma_pts[k + 1] - gamma_pts[k])
+    attr = _rescale(attr, target)
+
+    return _pack_result(f"Joint*-{path_opt}", attr, best_d_list, best_df_list,
+                        best_f_vals, best_gnorms, mu, N, t0, Q_history)
+
+
+def mu_optimized_ig(
+    model: nn.Module,
+    x: torch.Tensor,
+    baseline: torch.Tensor,
+    N: int = 50,
+    lam: float = 1.0,
+    tau: float = 0.01,
+    n_iter: int = 300,
+) -> AttributionResult:
+    """Straight line + optimal μ under the signal-harvesting objective."""
+    t0 = time.time()
+    delta_x, target, grads, d_list, df_list, f_vals, gnorms = \
+        _straight_line_pass(model, x, baseline, N)
+
+    d_arr = torch.tensor(d_list, device=x.device)
+    df_arr = torch.tensor(df_list, device=x.device)
+
+    mu = optimize_mu_signal_harvesting(
+        d_arr, df_arr, lam=lam, tau=tau, n_iter=n_iter)
+
+    grad_stack = torch.cat(grads, dim=0)
+    mu_4d = mu.view(N, 1, 1, 1)
+    wg = (mu_4d * grad_stack).sum(dim=0, keepdim=True)
+    attr = _rescale(delta_x * wg, target)
+
+    return _pack_result("μ-Optimized*", attr, d_list, df_list, f_vals,
+                        gnorms, mu, N, t0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §3  EVALUATION FUNCTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_methods_on_image(
+    model: nn.Module,
+    x: torch.Tensor,
+    baseline: torch.Tensor,
+    N: int = 50,
+    lam: float = 1.0,
+    tau: float = 0.01,
+    path_opt: str = "default",
+    guided_init: bool = False,
+) -> list[AttributionResult]:
+    """Run all attribution methods on a single image."""
+    results = []
+
+    # 1. Standard IG
+    results.append(standard_ig(model, x, baseline, N))
+
+    # 2. IDGI
+    results.append(idgi(model, x, baseline, N))
+
+    # 3. Guided IG
+    gig = guided_ig(model, x, baseline, N)
+    results.append(gig)
+
+    # 4. μ-Optimized*
+    results.append(mu_optimized_ig(
+        model, x, baseline, N, lam=lam, tau=tau, n_iter=300))
+
+    # 5. Joint*
+    init_path = gig.gamma_pts if guided_init else None
+    results.append(joint_star_ig_eval(
+        model, x, baseline, N,
+        G=16, patch_size=14,
+        n_alternating=2, lam=lam, tau=tau,
+        mu_iter=300, path_iter=10,
+        init_path=init_path,
+        path_opt=path_opt))
 
     return results
 
 
-def print_results_table(results: dict):
-    """Print formatted results table with mean ± std."""
-    print("\n" + "="*140)
-    print("EVALUATION RESULTS (Mean ± Std)")
-    print("="*140)
+def compute_metrics_for_methods(
+    model: nn.Module,
+    x: torch.Tensor,
+    baseline: torch.Tensor,
+    methods: list[AttributionResult],
+    insdel_steps: int = 100,
+    patch_size: int = 14,
+    use_slic: bool = True,
+) -> dict:
+    """Compute insertion/deletion metrics for all methods."""
+    metrics = {}
 
-    header = f"{'Method':<16} {'Q':>18} {'Var_ν':>18} {'Ins-Del':>18} {'Ins AUC':>18} {'Del AUC':>18} {'Time':>12} {'N':>5}"
-    print(header)
-    print("-"*140)
+    for m in methods:
+        # Pixel-based insertion/deletion
+        scores = compute_insertion_deletion(
+            model, x, baseline, m.attributions, n_steps=insdel_steps)
 
-    for method_name, metrics in results.items():
-        q_str = f"{metrics['Q_mean']:.4f}±{metrics['Q_std']:.4f}"
-        var_str = f"{metrics['Var_nu_mean']:.2e}±{metrics['Var_nu_std']:.2e}"
-        ins_del_str = f"{metrics['Ins-Del_mean']:.4f}±{metrics['Ins-Del_std']:.4f}"
-        ins_auc_str = f"{metrics['Ins_AUC_mean']:.4f}±{metrics['Ins_AUC_std']:.4f}"
-        del_auc_str = f"{metrics['Del_AUC_mean']:.4f}±{metrics['Del_AUC_std']:.4f}"
-        time_str = f"{metrics['Time_mean']:.1f}±{metrics['Time_std']:.1f}s"
-        n_str = f"{metrics['n_images']}"
+        # Region-based insertion/deletion
+        region_scores = compute_region_insertion_deletion(
+            model, x, baseline, m.attributions,
+            patch_size=patch_size, use_slic=use_slic)
 
-        print(f"{method_name:<16} {q_str:>18} {var_str:>18} {ins_del_str:>18} "
-              f"{ins_auc_str:>18} {del_auc_str:>18} {time_str:>12} {n_str:>5}")
+        metrics[m.name] = {
+            "Q": m.Q,
+            "CV2": m.CV2,
+            "Var_nu": m.Var_nu,
+            "insertion_auc": scores.insertion_auc,
+            "deletion_auc": scores.deletion_auc,
+            "ins_del": scores.insertion_auc - scores.deletion_auc,
+            "region_insertion_auc": region_scores.insertion_auc,
+            "region_deletion_auc": region_scores.deletion_auc,
+            "region_ins_del": region_scores.insertion_auc - region_scores.deletion_auc,
+            "elapsed_s": m.elapsed_s,
+        }
 
-    print("="*140)
+    return metrics
 
 
-def main():
+def evaluate_multiple_images(
+    n_test: int = 30,
+    N: int = 50,
+    lam: float = 1.0,
+    tau: float = 0.01,
+    path_opt: str = "default",
+    device: Optional[torch.device] = None,
+    min_conf: float = 0.70,
+    insdel_steps: int = 100,
+    patch_size: int = 14,
+    use_slic: bool = True,
+    guided_init: bool = False,
+    seed: int = 42,
+) -> dict:
+    """
+    Evaluate attribution methods on multiple images.
+
+    Args:
+        n_test: Number of images to evaluate
+        N: Number of interpolation steps
+        lam: Signal-harvesting strength
+        tau: L2 admissibility multiplier
+        path_opt: Path optimization method ("default", "lowrank", "gauss")
+        device: Torch device
+        min_conf: Minimum confidence for image selection
+        insdel_steps: Number of steps for insertion/deletion
+        patch_size: Patch size for region-based evaluation
+        use_slic: Use SLIC superpixels for regions
+        guided_init: Initialize Joint* from Guided IG path
+        seed: Random seed
+
+    Returns:
+        Dictionary with statistics and per-image results
+    """
+    set_seed(seed)
+
+    if device is None:
+        device = get_device()
+
+    print(f"\n{'='*70}")
+    print(f"Evaluation Configuration")
+    print(f"{'='*70}")
+    print(f"Number of test images: {n_test}")
+    print(f"Interpolation steps N: {N}")
+    print(f"Signal-harvesting λ:   {lam}")
+    print(f"L2 admissibility τ:    {tau}")
+    print(f"Path optimization:     {path_opt}")
+    print(f"Ins/Del steps:         {insdel_steps}")
+    print(f"Region mode:           {'SLIC' if use_slic else f'grid-{patch_size}'}")
+    print(f"Device:                {device}")
+    print(f"{'='*70}\n")
+
+    all_results = []
+    method_names = []
+
+    for img_idx in range(n_test):
+        print(f"[{img_idx+1}/{n_test}] Processing image {img_idx}...", end=" ", flush=True)
+
+        try:
+            # Load image
+            model, x, baseline, info = load_image_and_model(
+                device, min_conf, skip=img_idx)
+
+            # Run methods
+            methods = run_methods_on_image(
+                model, x, baseline, N=N, lam=lam, tau=tau,
+                path_opt=path_opt, guided_init=guided_init)
+
+            # Compute metrics
+            metrics = compute_metrics_for_methods(
+                model, x, baseline, methods,
+                insdel_steps=insdel_steps,
+                patch_size=patch_size,
+                use_slic=use_slic)
+
+            all_results.append({
+                "image_idx": img_idx,
+                "image_info": info,
+                "metrics": metrics,
+            })
+
+            if img_idx == 0:
+                method_names = list(metrics.keys())
+
+            print("✓")
+
+        except Exception as e:
+            print(f"✗ Error: {e}")
+            continue
+
+    # Compute statistics
+    print(f"\nComputing statistics across {len(all_results)} images...")
+    stats = compute_statistics(all_results, method_names)
+
+    return {
+        "config": {
+            "n_test": n_test,
+            "N": N,
+            "lam": lam,
+            "tau": tau,
+            "path_opt": path_opt,
+            "insdel_steps": insdel_steps,
+            "patch_size": patch_size,
+            "use_slic": use_slic,
+            "guided_init": guided_init,
+            "seed": seed,
+            "device": str(device),
+        },
+        "statistics": stats,
+        "per_image_results": all_results,
+    }
+
+
+def compute_statistics(all_results: list, method_names: list) -> dict:
+    """Compute mean and std across all images."""
+    stats = {}
+
+    for method_name in method_names:
+        metric_names = [
+            "Q", "CV2", "Var_nu",
+            "insertion_auc", "deletion_auc", "ins_del",
+            "region_insertion_auc", "region_deletion_auc", "region_ins_del",
+            "elapsed_s",
+        ]
+
+        method_stats = {}
+        for metric_name in metric_names:
+            values = []
+            for result in all_results:
+                if method_name in result["metrics"]:
+                    val = result["metrics"][method_name][metric_name]
+                    if val is not None and not np.isnan(val):
+                        values.append(val)
+
+            if len(values) > 0:
+                method_stats[metric_name] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "n": len(values),
+                }
+            else:
+                method_stats[metric_name] = {
+                    "mean": None,
+                    "std": None,
+                    "n": 0,
+                }
+
+        stats[method_name] = method_stats
+
+    return stats
+
+
+def print_statistics(stats: dict, config: dict):
+    """Print statistics table to terminal."""
+    print(f"\n{'='*70}")
+    print(f"Evaluation Results: {config['path_opt'].upper()} Path Optimization")
+    print(f"{'='*70}")
+    print(f"Configuration: N={config['N']}, λ={config['lam']}, "
+          f"τ={config['tau']}, n_test={config['n_test']}")
+    print(f"{'='*70}\n")
+
+    # Quality metrics
+    print("Quality Metrics (mean ± std):")
+    print(f"{'Method':<20} {'Q':>12} {'CV²':>12} {'Var_ν':>12} {'Time(s)':>12}")
+    print("-" * 70)
+
+    for method_name, method_stats in stats.items():
+        Q = method_stats["Q"]
+        CV2 = method_stats["CV2"]
+        Var_nu = method_stats["Var_nu"]
+        time_s = method_stats["elapsed_s"]
+
+        print(f"{method_name:<20} "
+              f"{Q['mean']:>5.4f}±{Q['std']:<5.4f} "
+              f"{CV2['mean']:>5.4f}±{CV2['std']:<5.4f} "
+              f"{Var_nu['mean']:>5.6f}±{Var_nu['std']:<5.6f} "
+              f"{time_s['mean']:>5.2f}±{time_s['std']:<5.2f}")
+
+    # Pixel-based Insertion/Deletion
+    print(f"\nPixel-based Insertion/Deletion (mean ± std):")
+    print(f"{'Method':<20} {'Ins AUC':>14} {'Del AUC':>14} {'Ins-Del':>14}")
+    print("-" * 70)
+
+    for method_name, method_stats in stats.items():
+        ins = method_stats["insertion_auc"]
+        dels = method_stats["deletion_auc"]
+        diff = method_stats["ins_del"]
+
+        print(f"{method_name:<20} "
+              f"{ins['mean']:>6.4f}±{ins['std']:<6.4f} "
+              f"{dels['mean']:>6.4f}±{dels['std']:<6.4f} "
+              f"{diff['mean']:>6.4f}±{diff['std']:<6.4f}")
+
+    # Region-based Insertion/Deletion
+    print(f"\nRegion-based Insertion/Deletion (mean ± std):")
+    print(f"{'Method':<20} {'R-Ins AUC':>14} {'R-Del AUC':>14} {'R-Ins-Del':>14}")
+    print("-" * 70)
+
+    for method_name, method_stats in stats.items():
+        r_ins = method_stats["region_insertion_auc"]
+        r_del = method_stats["region_deletion_auc"]
+        r_diff = method_stats["region_ins_del"]
+
+        print(f"{method_name:<20} "
+              f"{r_ins['mean']:>6.4f}±{r_ins['std']:<6.4f} "
+              f"{r_del['mean']:>6.4f}±{r_del['std']:<6.4f} "
+              f"{r_diff['mean']:>6.4f}±{r_diff['std']:<6.4f}")
+
+    print(f"\n{'='*70}\n")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# §4  MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import argparse
+
     parser = argparse.ArgumentParser(
-        description="Multi-Image Evaluation for Signal-Harvesting IG")
+        description="Signal-Harvesting IG Evaluation — Multi-image Statistics")
 
-    # Evaluation parameters
-    parser.add_argument("--n", type=int, default=1,
-                        help="Number of images to evaluate (default: 1)")
-    parser.add_argument("--image-folder", type=str, default=None,
-                        help="Folder containing images (default: auto-detect sample_imagenet1k)")
-
-    # Method parameters (same as signal_lam.py)
+    parser.add_argument("--n-test", type=int, default=30,
+                        help="Number of test images (default: 30)")
     parser.add_argument("--steps", type=int, default=50,
-                        help="Number of interpolation steps N")
+                        help="Number of interpolation steps N (default: 50)")
     parser.add_argument("--lam", type=float, default=1.0,
-                        help="Signal-harvesting strength λ")
+                        help="Signal-harvesting strength λ (default: 1.0)")
     parser.add_argument("--tau", type=float, default=0.01,
-                        help="L2 admissibility multiplier τ")
+                        help="L2 admissibility multiplier τ (default: 0.01)")
+    parser.add_argument("--path-opt", type=str, default="default",
+                        choices=["default", "lowrank", "gauss"],
+                        help="Path optimization method (default: default)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device (cuda/cpu, default: auto)")
     parser.add_argument("--min-conf", type=float, default=0.70,
-                        help="Minimum confidence threshold for images")
+                        help="Minimum confidence for image selection (default: 0.70)")
+    parser.add_argument("--insdel-steps", type=int, default=100,
+                        help="Number of steps for insertion/deletion (default: 100)")
+    parser.add_argument("--patch-size", type=int, default=14,
+                        help="Grid patch size for region-based evaluation (default: 14)")
+    parser.add_argument("--no-slic", action="store_true",
+                        help="Use grid patches instead of SLIC superpixels")
     parser.add_argument("--guided-init", action="store_true",
-                        help="Initialize Joint methods from Guided IG")
-
-    # Output parameters
+                        help="Initialize Joint* from Guided IG path")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (default: 42)")
     parser.add_argument("--json", type=str, default=None,
                         help="Export results to JSON file")
-    parser.add_argument("--device", type=str, default=None,
-                        help="Device (cuda/cpu)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed")
 
     args = parser.parse_args()
 
-    # Set random seed
-    set_seed(args.seed)
-
-    # Get device
     device = get_device(force=args.device)
-    print(f"Using device: {device}")
-
-    # Determine image folder
-    if args.image_folder is None:
-        # Auto-detect sample_imagenet1k
-        for candidate in ["./sample_imagenet1k", "../sample_imagenet1k",
-                          os.path.expanduser("~/sample_imagenet1k")]:
-            if os.path.isdir(candidate):
-                args.image_folder = candidate
-                break
-
-        if args.image_folder is None:
-            raise ValueError("No image folder found. Use --image-folder to specify path.")
-
-    print(f"Image folder: {args.image_folder}")
-    print(f"Evaluating on {args.n} images")
-    print(f"Parameters: N={args.steps}, λ={args.lam}, τ={args.tau}")
-
-    # Load backbone model once
-    print("\nLoading ResNet-50...")
-    backbone = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-    backbone = backbone.to(device).eval()
-    for p in backbone.parameters():
-        p.requires_grad_(False)
-
-    # Load images
-    print(f"\nLoading images from {args.image_folder}...")
-    images = load_images_from_folder(
-        args.image_folder,
-        n_images=args.n,
-        min_conf=args.min_conf,
-        device=device,
-        backbone=backbone,
-    )
 
     # Run evaluation
-    print(f"\nRunning evaluation on {len(images)} images...")
-    t0 = time.time()
-    results = run_evaluation_on_images(
-        images,
+    results = evaluate_multiple_images(
+        n_test=args.n_test,
         N=args.steps,
         lam=args.lam,
         tau=args.tau,
-        guided_init=args.guided_init,
+        path_opt=args.path_opt,
         device=device,
+        min_conf=args.min_conf,
+        insdel_steps=args.insdel_steps,
+        patch_size=args.patch_size,
+        use_slic=not args.no_slic,
+        guided_init=args.guided_init,
+        seed=args.seed,
     )
-    total_time = time.time() - t0
 
-    # Print results table
-    print_results_table(results)
-    print(f"\nTotal evaluation time: {total_time:.1f}s ({total_time/len(images):.1f}s per image)")
+    # Print statistics
+    print_statistics(results["statistics"], results["config"])
 
-    # Export to JSON if requested
+    # Export to JSON
     if args.json:
-        output = {
-            "config": {
-                "n_images": len(images),
-                "N": args.steps,
-                "lam": args.lam,
-                "tau": args.tau,
-                "min_conf": args.min_conf,
-                "guided_init": args.guided_init,
-                "image_folder": args.image_folder,
-                "device": str(device),
-                "seed": args.seed,
-            },
-            "results": results,
-            "total_time": total_time,
-        }
-
         with open(args.json, "w") as f:
-            json.dump(output, f, indent=2)
-
-        print(f"\nResults exported to {args.json}")
-
-
-if __name__ == "__main__":
-    main()
+            json.dump(results, f, indent=2)
+        print(f"Results saved to: {args.json}")
