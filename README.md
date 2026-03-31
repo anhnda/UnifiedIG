@@ -202,7 +202,7 @@ scikit-image  (optional, for SLIC superpixels)
 ## References
 
 **Primary Paper**:
-- Anonymous. "Least Action Integrated Gradients." Under review, 2024.
+- Anonymous. "Least Action Integrated Gradients." Under review, 2026.
 
 **Related Work**:
 - Sundararajan, Taly, Yan. "Axiomatic Attribution for Deep Networks." ICML 2017.
@@ -216,7 +216,7 @@ scikit-image  (optional, for SLIC superpixels)
 If you use this code in your research, please cite:
 
 ```bibtex
-@article{lig2024,
+@article{lig2026,
   title={Least Action Integrated Gradients},
   author={Anonymous},
   journal={Under review},
